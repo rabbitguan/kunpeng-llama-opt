@@ -679,6 +679,11 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
+#ifdef GGML_USE_CPU_REPACK
+    if (strcmp(name, "ggml_backend_cpu_repack_set_q4_0_kernel") == 0) {
+        return (void *)ggml_backend_cpu_repack_set_q4_0_kernel;
+    }
+#endif
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

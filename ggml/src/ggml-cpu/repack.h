@@ -9,6 +9,7 @@
 // GGML internal header
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
+void ggml_backend_cpu_repack_set_q4_0_kernel(enum ggml_backend_cpu_repack_q4_0_kernel kernel);
 
 template <int K> constexpr int QK_0() {
     if constexpr (K == 1) {

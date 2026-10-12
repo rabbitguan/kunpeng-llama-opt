@@ -11,7 +11,9 @@
 
 #include "arch-fallback.h"
 
+#include <atomic>
 #include <cmath>
+#include <cinttypes>
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
@@ -4922,7 +4924,37 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 }  // namespace ggml::cpu::repack
 
-static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+static ggml_backend_cpu_repack_q4_0_kernel ggml_repack_q4_0_kernel = GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO;
+static std::atomic<bool> ggml_repack_q4_0_kernel_logged(false);
+
+void ggml_backend_cpu_repack_set_q4_0_kernel(enum ggml_backend_cpu_repack_q4_0_kernel kernel) {
+    GGML_ASSERT(kernel >= GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO && kernel <= GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8);
+    ggml_repack_q4_0_kernel = kernel;
+    ggml_repack_q4_0_kernel_logged.store(false);
+}
+
+static const char * ggml_repack_q4_0_kernel_name(enum ggml_backend_cpu_repack_q4_0_kernel kernel) {
+    switch (kernel) {
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO: return "auto";
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4:  return "4x4";
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X8:  return "4x8";
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8:  return "8x8";
+    }
+    return "unknown";
+}
+
+static void ggml_repack_log_q4_0_kernel(enum ggml_backend_cpu_repack_q4_0_kernel selected) {
+    if (ggml_repack_q4_0_kernel_logged.exchange(true)) {
+        return;
+    }
+    GGML_LOG_INFO("Q4_0 repack kernel: requested=%s selected=%s\n",
+                  ggml_repack_q4_0_kernel_name(ggml_repack_q4_0_kernel), ggml_repack_q4_0_kernel_name(selected));
+    GGML_LOG_INFO("CPU features: neon=%d dotprod=%d i8mm=%d sve=%d sve_bytes=%d avx2=%d vxe=%d\n",
+                  ggml_cpu_has_neon(), ggml_cpu_has_dotprod(), ggml_cpu_has_matmul_int8(), ggml_cpu_has_sve(),
+                  ggml_cpu_get_sve_cnt(), ggml_cpu_has_avx2(), ggml_cpu_has_vxe());
+}
+
+static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur, bool report_error = false) {
     // instance for Q1_0
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 4, 4, GGML_TYPE_Q8_0> q1_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 8, 4, GGML_TYPE_Q8_0> q1_0_4x8_q8_0;
@@ -4972,23 +5004,68 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 #endif
 
     if (cur->type == GGML_TYPE_Q4_0) {
+        const bool supports_8x8 = ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0);
+        const bool supports_4x8 = ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8();
+        const bool supports_4x4 = (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) || ggml_cpu_has_vxe();
+
+        if (ggml_repack_q4_0_kernel != GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO) {
+            const ggml::cpu::tensor_traits * selected = nullptr;
+            bool hardware_supported = false;
+            int64_t row_multiple = 0;
+            switch (ggml_repack_q4_0_kernel) {
+                case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4:
+                    hardware_supported = supports_4x4;
+                    row_multiple = 4;
+                    selected = &q4_0_4x4_q8_0;
+                    break;
+                case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X8:
+                    hardware_supported = supports_4x8;
+                    row_multiple = 4;
+                    selected = &q4_0_4x8_q8_0;
+                    break;
+                case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8:
+                    hardware_supported = supports_8x8;
+                    row_multiple = 8;
+                    selected = &q4_0_8x8_q8_0;
+                    break;
+                case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO:
+                    GGML_ABORT("invalid Q4_0 repack kernel");
+            }
+            if (hardware_supported && cur->ne[1] % row_multiple == 0) {
+                ggml_repack_log_q4_0_kernel(ggml_repack_q4_0_kernel);
+                return selected;
+            }
+            if (!report_error) {
+                return selected;
+            }
+            GGML_LOG_ERROR("Q4_0 repack kernel '%s' is not supported: shape=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] neon=%d dotprod=%d i8mm=%d sve=%d sve_bytes=%d avx2=%d vxe=%d\n",
+                           ggml_repack_q4_0_kernel_name(ggml_repack_q4_0_kernel),
+                           cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3], ggml_cpu_has_neon(),
+                           ggml_cpu_has_dotprod(), ggml_cpu_has_matmul_int8(), ggml_cpu_has_sve(),
+                           ggml_cpu_get_sve_cnt(), ggml_cpu_has_avx2(), ggml_cpu_has_vxe());
+            return nullptr;
+        }
         if (ggml_cpu_has_avx2() || (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() && ggml_cpu_get_sve_cnt() == QK8_0)) {
             if (cur->ne[1] % 8 == 0) {
+                ggml_repack_log_q4_0_kernel(GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8);
                 return &q4_0_8x8_q8_0;
             }
         }
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             if (cur->ne[1] % 4 == 0) {
+                ggml_repack_log_q4_0_kernel(GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X8);
                 return &q4_0_4x8_q8_0;
             }
         }
         if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
             if (cur->ne[1] % 4 == 0) {
+                ggml_repack_log_q4_0_kernel(GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4);
                 return &q4_0_4x4_q8_0;
             }
         }
         if (ggml_cpu_has_vxe()) {
             if (cur->ne[1] % 4 == 0) {
+                ggml_repack_log_q4_0_kernel(GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4);
                 return &q4_0_4x4_q8_0;
             }
         }
@@ -5141,7 +5218,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 }
 
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
+    tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor, true));
+
+    if (tensor->type == GGML_TYPE_Q4_0 && ggml_repack_q4_0_kernel != GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO && tensor->extra == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
 
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;

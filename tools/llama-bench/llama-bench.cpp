@@ -25,6 +25,7 @@
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "log.h"
 
@@ -256,6 +257,31 @@ static bool output_format_from_str(const std::string & s, output_formats & forma
     return true;
 }
 
+static const char * q4_kernel_str(ggml_backend_cpu_repack_q4_0_kernel kernel) {
+    switch (kernel) {
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO: return "auto";
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4:  return "4x4";
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X8:  return "4x8";
+        case GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8:  return "8x8";
+    }
+    return "unknown";
+}
+
+static bool q4_kernel_from_str(const std::string & s, ggml_backend_cpu_repack_q4_0_kernel & kernel) {
+    if (s == "auto") {
+        kernel = GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO;
+    } else if (s == "4x4") {
+        kernel = GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4;
+    } else if (s == "4x8") {
+        kernel = GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X8;
+    } else if (s == "8x8") {
+        kernel = GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static const char * split_mode_str(llama_split_mode mode) {
     switch (mode) {
         case LLAMA_SPLIT_MODE_NONE:
@@ -365,6 +391,7 @@ struct cmd_params {
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
     std::vector<bool>                repack;
+    ggml_backend_cpu_repack_q4_0_kernel q4_kernel;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     ggml_numa_strategy               numa;
@@ -411,6 +438,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
     /* repack               */ { llama_model_default_params().use_extra_bufts },
+    /* q4_kernel            */ GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO,
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
@@ -486,6 +514,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
     printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("  --repack <0|1>                                    (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
+    printf("  --q4-kernel <auto|4x4|4x8|8x8>                   Q4_0 repack kernel (default: auto)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -539,6 +568,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.q4_kernel            = cmd_params_defaults.q4_kernel;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -916,6 +946,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.repack.insert(params.repack.end(), p.begin(), p.end());
+            } else if (arg == "--q4-kernel") {
+                if (++i >= argc || !q4_kernel_from_str(argv[i], params.q4_kernel)) {
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1186,6 +1221,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.repack.empty()) {
         params.repack = cmd_params_defaults.repack;
     }
+    if (params.q4_kernel != GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO &&
+        std::find(params.repack.begin(), params.repack.end(), false) != params.repack.end()) {
+        fprintf(stderr, "error: --q4-kernel %s cannot be used with --repack 0\n", q4_kernel_str(params.q4_kernel));
+        exit(1);
+    }
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
@@ -1236,6 +1276,7 @@ struct cmd_params_instance {
     bool               no_op_offload;
     bool               no_host;
     bool               repack;
+    ggml_backend_cpu_repack_q4_0_kernel q4_kernel;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
@@ -1298,7 +1339,7 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
-               devices == other.devices && no_host == other.no_host && repack == other.repack &&
+               devices == other.devices && no_host == other.no_host && repack == other.repack && q4_kernel == other.q4_kernel &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1384,6 +1425,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
                 /* .repack                = */ rpk,
+                /* .q4_kernel             = */ params.q4_kernel,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1422,6 +1464,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
                 /* .repack                = */ rpk,
+                /* .q4_kernel             = */ params.q4_kernel,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1460,6 +1503,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
                 /* .repack                = */ rpk,
+                /* .q4_kernel             = */ params.q4_kernel,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1503,6 +1547,7 @@ struct test {
     bool                     no_op_offload;
     bool                     no_host;
     bool                     repack;
+    ggml_backend_cpu_repack_q4_0_kernel q4_kernel;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
@@ -1544,6 +1589,7 @@ struct test {
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
         repack         = inst.repack;
+        q4_kernel      = inst.q4_kernel;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
@@ -1604,7 +1650,7 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
-            "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
+            "no_op_offload",  "no_host",        "repack",        "q4_kernel",     "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1703,6 +1749,7 @@ struct test {
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
                                             std::to_string(repack),
+                                            q4_kernel_str(q4_kernel),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
@@ -2280,6 +2327,14 @@ int llama_bench(int argc, char ** argv) {
     auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
+    using ggml_repack_set_q4_0_kernel_t = void (*)(ggml_backend_cpu_repack_q4_0_kernel);
+    auto * ggml_repack_set_q4_0_kernel_fn = (ggml_repack_set_q4_0_kernel_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_repack_set_q4_0_kernel");
+    if (ggml_repack_set_q4_0_kernel_fn) {
+        ggml_repack_set_q4_0_kernel_fn(params.q4_kernel);
+    } else if (params.q4_kernel != GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO) {
+        fprintf(stderr, "%s: error: --q4-kernel requires a CPU backend built with repack support\n", __func__);
+        return 1;
+    }
 
     // initialize llama.cpp
     if (!params.verbose) {

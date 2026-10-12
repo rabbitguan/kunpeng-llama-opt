@@ -138,6 +138,13 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
 
+    enum ggml_backend_cpu_repack_q4_0_kernel {
+        GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_AUTO = 0,
+        GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X4,
+        GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_4X8,
+        GGML_BACKEND_CPU_REPACK_Q4_0_KERNEL_8X8,
+    };
+
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
