@@ -264,8 +264,8 @@ def llvm_candidates(source, environ=None):
 
 
 def command_output(command, env=None):
-    completed = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    return completed.returncode, (completed.stdout or "").strip()
+    completed = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return completed.returncode, (completed.stdout or "").strip(), (completed.stderr or "").strip()
 
 
 def validate_llvm_root(root):
@@ -281,19 +281,25 @@ def validate_llvm_root(root):
             details.append("not executable: {}".format(", ".join(not_executable)))
         return False, "; ".join(details)
     versions = {}
+    warnings_by_tool = {}
     for path in required:
         try:
-            returncode, output = command_output([str(path), "--version"])
+            returncode, stdout, stderr = command_output([str(path), "--version"])
         except OSError as error:
             return False, "cannot execute {}: {}".format(path, error)
-        versions[path.name] = output.splitlines()[0] if output else ""
+        if stderr:
+            warnings_by_tool[path.name] = stderr
         if returncode:
-            return False, "{} --version failed with exit code {}: {}".format(path, returncode, output)
+            return False, "{} --version failed with exit code {}: stdout={!r}; stderr={!r}".format(path, returncode, stdout, stderr)
+        if "error while loading shared libraries" in stderr or "symbol lookup error" in stderr:
+            return False, "{} --version reported a dynamic loader failure: {}".format(path, stderr)
+        versions[path.name] = stdout
     llvm_version = versions["llvm-config"]
     if llvm_version != LLVM_VERSION:
-        return False, "llvm-config version {} is not the pinned {}".format(llvm_version, LLVM_VERSION)
+        return False, "llvm-config stdout {!r} is not the pinned version {!r}; stderr={!r}".format(llvm_version, LLVM_VERSION, warnings_by_tool.get("llvm-config", ""))
     if LLVM_VERSION not in versions["clang"] or LLVM_VERSION not in versions["clang++"]:
         return False, "clang and clang++ do not report pinned version {}: clang={!r}, clang++={!r}".format(LLVM_VERSION, versions["clang"], versions["clang++"])
+    versions["stderr"] = warnings_by_tool
     return True, versions
 
 
@@ -362,6 +368,8 @@ def extract_local_llvm_archive(recorder, source, archive):
 def prepare_llvm(recorder, source):
     llvm_root, diagnostics = find_llvm_root(source)
     if llvm_root is not None:
+        for tool, warning in diagnostics.get("stderr", {}).items():
+            recorder.log("{} --version stderr warning: {}".format(tool, warning))
         return llvm_root, diagnostics
     archives = [path for path in llvm_archive_candidates(source) if path.is_file()]
     if archives:
@@ -369,6 +377,8 @@ def prepare_llvm(recorder, source):
         valid, detail = validate_llvm_root(restored)
         if not valid:
             raise RuntimeError("LLVM remains invalid after extracting {}: {}".format(archives[0], detail))
+        for tool, warning in detail.get("stderr", {}).items():
+            recorder.log("{} --version stderr warning: {}".format(tool, warning))
         recorder.log("recovered validated LLVM {} from local archive {}".format(LLVM_VERSION, archives[0]))
         return restored.resolve(), detail
     partial = [path for path in llvm_candidates(source) if path.is_dir() and str(path).startswith(str((source / "build").resolve()))]

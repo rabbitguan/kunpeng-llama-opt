@@ -44,6 +44,37 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(root, binary.parent.resolve())
             self.assertEqual(versions["llvm-config"], "17.0.6")
 
+    def test_llvm_config_libtinfo_stderr_warning_is_not_a_version_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            binary = source / "build" / "clang+llvm-17.0.6-aarch64-linux-gnu" / "bin"
+            binary.mkdir(parents=True)
+            self.make_tool(binary / "clang", "clang version 17.0.6")
+            self.make_tool(binary / "clang++", "clang version 17.0.6")
+            warning = "/usr/lib64/libtinfo.so.6: no version information available"
+            (binary / "llvm-config").write_text("#!/bin/sh\nprintf '%s\\n' '" + warning + "' >&2\nprintf '%s\\n' '17.0.6'\n", encoding="ascii")
+            (binary / "llvm-config").chmod((binary / "llvm-config").stat().st_mode | stat.S_IXUSR)
+            recorder = RecordingRunner()
+            root, versions = prepare_llvm(recorder, source)
+            self.assertEqual(root, binary.parent.resolve())
+            self.assertEqual(versions["llvm-config"], "17.0.6")
+            self.assertEqual(versions["stderr"]["llvm-config"], warning)
+            self.assertIn("llvm-config --version stderr warning: " + warning, recorder.messages)
+
+    def test_llvm_config_dynamic_loader_failure_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = root / "bin"
+            binary.mkdir(parents=True)
+            self.make_tool(binary / "clang", "clang version 17.0.6")
+            self.make_tool(binary / "clang++", "clang version 17.0.6")
+            (binary / "llvm-config").write_text("#!/bin/sh\nprintf '%s\\n' 'error while loading shared libraries: libLLVM.so' >&2\nexit 127\n", encoding="ascii")
+            (binary / "llvm-config").chmod((binary / "llvm-config").stat().st_mode | stat.S_IXUSR)
+            valid, detail = validate_llvm_root(root)
+            self.assertFalse(valid)
+            self.assertIn("exit code 127", detail)
+            self.assertIn("error while loading shared libraries", detail)
+
     def test_incomplete_toolchain_reports_exact_missing_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
