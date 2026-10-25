@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "paths": {
+    "project_root": "/data/home/2300013234/kunpeng-llama-opt",
+    "tmac_root": "/data/home/2300013234/kunpeng-llama-opt/tmac",
+    "results_root": "/data/home/2300013234/kunpeng-llama-opt/results",
+    "model": "/data/home/2300013234/kunpeng-llm/models/Meta-Llama-3-8B-Instruct-Q4_0.gguf",
+    "c1_build": "/data/home/2300013234/kunpeng-llama-opt/builds/q4-stage-gcc10"
+  },
+  "source": {
+    "url": "https://github.com/microsoft/T-MAC.git",
+    "commit": "7042f8f73330bd083bc1e4bc5ccb3f88a4904aee",
+    "submodules": {
+      "3rdparty/llama.cpp": "eb07ecf0172230d58fff5d23a3fd6feebda35065",
+      "3rdparty/tvm": "36b9535ff364c484d04b384555106731049f44cd",
+      "t-man/executorch": "817bd29dfbea4979a27f2f539c753bd46757ea7a"
+    }
+  },
+  "quantization": {
+    "bits": 4,
+    "weight_group_size": 32,
+    "act_group_size": 32,
+    "lut_group": 4,
+    "fast_aggregation": false,
+    "lut_dtype": "int8",
+    "output_dtype": "float16",
+    "aggregation_dtype": "int32",
+    "zero_point": false
+  },
+  "operator": {
+    "shapes": [[14336, 4096], [4096, 14336], [4096, 4096], [1024, 4096]],
+    "tokens": [1, 32, 128],
+    "rounds": 5,
+    "seed": 20241025,
+    "max_nmse_lut": 0.0005,
+    "max_abs_pack": 0.0
+  },
+  "model_benchmark": {
+    "threads": [1, 8, 16],
+    "rounds": 3,
+    "numa_node": 0,
+    "prefill_tokens": 128,
+    "decode_tokens": 128,
+    "context_tokens": 512,
+    "batch": 128,
+    "micro_batch": 128,
+    "measurement_budget_seconds": 3300,
+    "prompt": "The quick brown fox jumps over the lazy dog. Explain why this sentence is useful."
+  },
+  "variants": ["baseline", "A", "B", "AB"]
+}
