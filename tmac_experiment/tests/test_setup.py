@@ -4,13 +4,14 @@ import pathlib
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from experiment import Recorder, find_llvm_root, git_has_commit, missing_preinstall_commands, prepare_submodules, run_git_network, source_environment
+from experiment import Recorder, build_tvm_with_existing_llvm, find_llvm_root, git_has_commit, missing_preinstall_commands, prepare_llvm, prepare_submodules, run_git_network, source_environment, validate_llvm_root
 
 
 class RecordingRunner:
@@ -42,6 +43,72 @@ class SetupTest(unittest.TestCase):
             root, versions = find_llvm_root(source)
             self.assertEqual(root, binary.parent.resolve())
             self.assertEqual(versions["llvm-config"], "17.0.6")
+
+    def test_incomplete_toolchain_reports_exact_missing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = root / "bin"
+            binary.mkdir(parents=True)
+            self.make_tool(binary / "clang", "clang version 17.0.6")
+            valid, detail = validate_llvm_root(root)
+            self.assertFalse(valid)
+            self.assertIn(str(binary / "clang++"), detail)
+            self.assertIn(str(binary / "llvm-config"), detail)
+
+    def test_recovers_incomplete_toolchain_from_local_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "source"
+            build = source / "build"
+            name = "clang+llvm-17.0.6-aarch64-linux-gnu"
+            partial = build / name
+            partial.mkdir(parents=True)
+            (partial / "partial.txt").write_text("keep\n", encoding="ascii")
+            payload = pathlib.Path(directory) / "payload" / name / "bin"
+            payload.mkdir(parents=True)
+            self.make_tool(payload / "clang", "clang version 17.0.6")
+            self.make_tool(payload / "clang++", "clang version 17.0.6")
+            self.make_tool(payload / "llvm-config", "17.0.6")
+            archive = build / (name + ".tar.xz")
+            with tarfile.open(archive, "w:xz") as handle:
+                handle.add(payload.parent, arcname=name)
+            recorder = RecordingRunner()
+            with mock.patch("experiment.platform.system", return_value="Linux"), mock.patch("experiment.platform.machine", return_value="aarch64"):
+                root, versions = prepare_llvm(recorder, source)
+            self.assertEqual(root, partial.resolve())
+            self.assertEqual(versions["llvm-config"], "17.0.6")
+            self.assertTrue((partial / "partial.txt").is_file())
+            self.assertIn("recovered validated LLVM 17.0.6", "\n".join(recorder.messages))
+
+    def test_incomplete_toolchain_without_archive_does_not_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "source"
+            binary = source / "build" / "clang+llvm-17.0.6-aarch64-linux-gnu" / "bin"
+            binary.mkdir(parents=True)
+            self.make_tool(binary / "clang", "clang version 17.0.6")
+            recorder = RecordingRunner()
+            with mock.patch("experiment.platform.system", return_value="Linux"), mock.patch("experiment.platform.machine", return_value="aarch64"):
+                with self.assertRaisesRegex(RuntimeError, "will not be downloaded again automatically") as raised:
+                    prepare_llvm(recorder, source)
+            self.assertIn(str(binary / "clang++"), str(raised.exception))
+            self.assertEqual(recorder.commands, [])
+
+    def test_tvm_build_reuses_llvm_and_existing_build_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "source"
+            template = source / "3rdparty" / "tvm" / "cmake" / "config.cmake"
+            template.parent.mkdir(parents=True)
+            template.write_text("set(USE_CUDA OFF)\n", encoding="ascii")
+            build = source / "3rdparty" / "tvm" / "build"
+            build.mkdir()
+            marker = build / "resume-marker"
+            marker.write_text("keep\n", encoding="ascii")
+            llvm_root = source / "build" / "clang+llvm-17.0.6-aarch64-linux-gnu"
+            recorder = RecordingRunner()
+            build_tvm_with_existing_llvm(recorder, source, llvm_root)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(recorder.commands[0][0], ["cmake", "-S", str(source / "3rdparty" / "tvm"), "-B", str(build), "-DUSE_LLVM={}".format(llvm_root / "bin" / "llvm-config")])
+            self.assertEqual(recorder.commands[1][0], ["cmake", "--build", str(build), "-j", "4"])
+            self.assertIn(str(llvm_root / "bin" / "llvm-config"), (build / "config.cmake").read_text(encoding="utf-8"))
 
     def test_preinstall_check_does_not_require_clang(self):
         with tempfile.TemporaryDirectory() as directory:

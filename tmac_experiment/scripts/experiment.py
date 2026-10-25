@@ -8,6 +8,7 @@ import math
 import os
 import pathlib
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -18,12 +19,19 @@ import tarfile
 import threading
 import time
 import traceback
+import warnings
 
 from reference import self_test
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 EXPERIMENT_DIR = SCRIPT_DIR.parent
+LLVM_VERSION = "17.0.6"
+LLVM_ARCHIVE_NAMES = {
+    ("Linux", "aarch64"): "clang+llvm-17.0.6-aarch64-linux-gnu.tar.xz",
+    ("Linux", "x86_64"): "clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz",
+    ("Darwin", "arm64"): "clang+llvm-17.0.6-arm64-apple-darwin22.0.tar.xz",
+}
 
 
 def load_config(path, overrides):
@@ -241,7 +249,7 @@ def llvm_candidates(source, environ=None):
         candidates.append(pathlib.Path(configured))
     build = source / "build"
     if build.is_dir():
-        candidates.extend(sorted(build.glob("clang+llvm-17.0.6-*")))
+        candidates.extend(path for path in sorted(build.glob("clang+llvm-17.0.6-*")) if path.is_dir())
     llvm_config = shutil.which("llvm-config", path=environ.get("PATH"))
     if llvm_config:
         candidates.append(pathlib.Path(llvm_config).resolve().parent.parent)
@@ -263,19 +271,29 @@ def command_output(command, env=None):
 def validate_llvm_root(root):
     binary = root / "bin"
     required = [binary / "clang", binary / "clang++", binary / "llvm-config"]
-    if not all(path.is_file() and os.access(path, os.X_OK) for path in required):
-        return False, "missing clang, clang++, or llvm-config under {}".format(binary)
+    missing = [str(path) for path in required if not path.is_file()]
+    not_executable = [str(path) for path in required if path.is_file() and not os.access(path, os.X_OK)]
+    if missing or not_executable:
+        details = []
+        if missing:
+            details.append("missing files: {}".format(", ".join(missing)))
+        if not_executable:
+            details.append("not executable: {}".format(", ".join(not_executable)))
+        return False, "; ".join(details)
     versions = {}
     for path in required:
-        returncode, output = command_output([str(path), "--version"])
+        try:
+            returncode, output = command_output([str(path), "--version"])
+        except OSError as error:
+            return False, "cannot execute {}: {}".format(path, error)
         versions[path.name] = output.splitlines()[0] if output else ""
         if returncode:
-            return False, "{} --version failed: {}".format(path, output)
+            return False, "{} --version failed with exit code {}: {}".format(path, returncode, output)
     llvm_version = versions["llvm-config"]
-    if llvm_version != "17.0.6":
-        return False, "llvm-config version {} is not the pinned 17.0.6".format(llvm_version)
-    if "17.0.6" not in versions["clang"] or "17.0.6" not in versions["clang++"]:
-        return False, "clang and clang++ do not report pinned version 17.0.6"
+    if llvm_version != LLVM_VERSION:
+        return False, "llvm-config version {} is not the pinned {}".format(llvm_version, LLVM_VERSION)
+    if LLVM_VERSION not in versions["clang"] or LLVM_VERSION not in versions["clang++"]:
+        return False, "clang and clang++ do not report pinned version {}: clang={!r}, clang++={!r}".format(LLVM_VERSION, versions["clang"], versions["clang++"])
     return True, versions
 
 
@@ -289,10 +307,86 @@ def find_llvm_root(source):
     return None, diagnostics
 
 
+def llvm_archive_name():
+    machine = platform.machine()
+    machine = {"arm64": "aarch64", "AMD64": "x86_64", "ARM64": "aarch64"}.get(machine, machine)
+    return LLVM_ARCHIVE_NAMES.get((platform.system(), machine))
+
+
+def llvm_archive_candidates(source, environ=None):
+    environ = os.environ if environ is None else environ
+    candidates = []
+    configured = environ.get("TMAC_LLVM_ARCHIVE")
+    if configured:
+        candidates.append(pathlib.Path(configured))
+    name = llvm_archive_name()
+    if name:
+        candidates.extend([source / "build" / name, source / name, source.parent / name, source.parent / "downloads" / name])
+    result = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return result
+
+
+def extract_local_llvm_archive(recorder, source, archive):
+    official_name = llvm_archive_name()
+    expected_name = official_name[:-len(".tar.xz")] if official_name else archive.name[:-len(".tar.xz")]
+    recorder.log("validating local LLVM archive {}".format(archive))
+    (source / "build").mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive, "r:xz") as handle:
+            members = handle.getmembers()
+            for member in members:
+                path = pathlib.PurePosixPath(member.name)
+                if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != expected_name:
+                    raise RuntimeError("unsafe or unexpected path in LLVM archive: {}".format(member.name))
+                if member.issym() or member.islnk():
+                    target = pathlib.PurePosixPath(member.linkname)
+                    base = path.parent if member.issym() else pathlib.PurePosixPath()
+                    resolved_target = pathlib.PurePosixPath(posixpath.normpath(str(base / target)))
+                    if target.is_absolute() or not resolved_target.parts or resolved_target.parts[0] != expected_name:
+                        raise RuntimeError("unsafe link in LLVM archive: {} -> {}".format(member.name, member.linkname))
+            recorder.log("extracting local LLVM archive over the incomplete directory; existing files are preserved")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                handle.extractall(source / "build")
+    except (OSError, tarfile.TarError) as error:
+        raise RuntimeError("local LLVM archive is unreadable or incomplete: {}: {}".format(archive, error)) from error
+    return source / "build" / expected_name
+
+
+def prepare_llvm(recorder, source):
+    llvm_root, diagnostics = find_llvm_root(source)
+    if llvm_root is not None:
+        return llvm_root, diagnostics
+    archives = [path for path in llvm_archive_candidates(source) if path.is_file()]
+    if archives:
+        restored = extract_local_llvm_archive(recorder, source, archives[0])
+        valid, detail = validate_llvm_root(restored)
+        if not valid:
+            raise RuntimeError("LLVM remains invalid after extracting {}: {}".format(archives[0], detail))
+        recorder.log("recovered validated LLVM {} from local archive {}".format(LLVM_VERSION, archives[0]))
+        return restored.resolve(), detail
+    partial = [path for path in llvm_candidates(source) if path.is_dir() and str(path).startswith(str((source / "build").resolve()))]
+    if partial:
+        searched = ", ".join(str(path) for path in llvm_archive_candidates(source)) or "no archive name for this platform"
+        raise RuntimeError("project-local LLVM is incomplete and will not be downloaded again automatically: {}. Place a complete local archive at one of: {}, or set TMAC_LLVM_ARCHIVE".format("; ".join(diagnostics), searched))
+    return None, diagnostics
+
+
 def tvm_library_paths(source):
     build = source / "3rdparty" / "tvm" / "build"
     patterns = ["libtvm.so", "libtvm.dylib", "tvm.dll", "libtvm_runtime.so", "libtvm_runtime.dylib", "tvm_runtime.dll"]
     return [build / name for name in patterns if (build / name).is_file()]
+
+
+def has_tvm_compiler_library(source):
+    required = "libtvm.so" if platform.system() == "Linux" else "libtvm.dylib" if platform.system() == "Darwin" else "tvm.dll"
+    return any(path.name == required for path in tvm_library_paths(source))
 
 
 def source_environment(source, llvm_root=None, base_env=None):
@@ -321,8 +415,7 @@ def source_environment(source, llvm_root=None, base_env=None):
 
 
 def validate_tvm_build(recorder, source, python, runtime_env):
-    libraries = tvm_library_paths(source)
-    if not any(path.name.startswith("libtvm.") or path.name == "tvm.dll" for path in libraries):
+    if not has_tvm_compiler_library(source):
         raise RuntimeError("TVM build library is missing under {}".format(source / "3rdparty" / "tvm" / "build"))
     config = source / "3rdparty" / "tvm" / "build" / "config.cmake"
     llvm_config = pathlib.Path(runtime_env["TMAC_LLVM_ROOT"]) / "bin" / "llvm-config"
@@ -346,8 +439,8 @@ def build_tvm_with_existing_llvm(recorder, source, llvm_root):
             handle.write("\n" + setting + "\n")
     runtime_env = source_environment(source, llvm_root)
     recorder.log("building pinned TVM with the already validated LLVM 17.0.6 toolchain")
-    recorder.run(["cmake", ".."], cwd=build, env=runtime_env)
-    recorder.run(["cmake", "--build", ".", "-j", "4"], cwd=build, env=runtime_env)
+    recorder.run(["cmake", "-S", str(tvm), "-B", str(build), "-DUSE_LLVM={}".format(llvm_config)], cwd=source, env=runtime_env)
+    recorder.run(["cmake", "--build", str(build), "-j", "4"], cwd=source, env=runtime_env)
 
 
 def missing_preinstall_commands(path=None):
@@ -394,37 +487,36 @@ def setup(config, recorder):
     install_env = {"MANUAL_BUILD": "0"}
     stamp = root / ".setup-fingerprint"
     current = fingerprint(config, commits)
-    llvm_root, llvm_detail = find_llvm_root(source)
-    libraries = tvm_library_paths(source)
+    llvm_root, llvm_detail = prepare_llvm(recorder, source)
     editable_installed = subprocess.run([str(python), "-m", "pip", "show", "t-mac"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    prepared = not venv_created and editable_installed and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == current and llvm_root is not None and bool(libraries)
+    prepared = not venv_created and editable_installed and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == current and llvm_root is not None and has_tvm_compiler_library(source)
     if prepared:
         recorder.log("setup fingerprint and build artifacts match; skipping dependency download and rebuild")
     else:
         if stamp.exists():
             stamp.unlink()
-        recorder.run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=source)
-        recorder.run([str(python), "-m", "pip", "install", "-r", "requirements-codegen.txt"], cwd=source)
+        if editable_installed:
+            recorder.log("reusing the installed T-MAC Python package and its dependencies")
+        else:
+            recorder.run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=source)
+            recorder.run([str(python), "-m", "pip", "install", "-r", "requirements-codegen.txt"], cwd=source)
     if llvm_root is not None:
         recorder.log("reusing validated LLVM toolchain {}: {}".format(llvm_root, llvm_detail))
     else:
         recorder.log("no validated LLVM 17.0.6 toolchain found before install: {}".format("; ".join(llvm_detail) or "no candidates"))
-    if not prepared and llvm_root is not None and not libraries:
+    if not prepared and llvm_root is not None:
         build_tvm_with_existing_llvm(recorder, source, llvm_root)
-        libraries = tvm_library_paths(source)
     if not prepared and llvm_root is None:
         recorder.log("running pinned T-MAC editable install with its official LLVM 17.0.6 and TVM build hook")
         recorder.run([str(python), "-m", "pip", "install", "--no-deps", "--force-reinstall", "-e", ".", "-v"], cwd=source, env=install_env)
         llvm_root, llvm_detail = find_llvm_root(source)
-        libraries = tvm_library_paths(source)
-        if llvm_root is None or not libraries:
+        if llvm_root is None or not has_tvm_compiler_library(source):
             recorder.log("editable install did not execute or complete the pinned build_py hook; invoking that official hook explicitly")
             recorder.run([str(python), "setup.py", "build_py"], cwd=source, env=install_env)
             llvm_root, llvm_detail = find_llvm_root(source)
-            libraries = tvm_library_paths(source)
         if llvm_root is None:
             raise RuntimeError("official build hook returned but did not produce a validated LLVM 17.0.6 toolchain: {}".format("; ".join(llvm_detail) or "no candidates"))
-        if not libraries:
+        if not has_tvm_compiler_library(source):
             raise RuntimeError("official build hook returned but did not produce TVM shared libraries under {}".format(source / "3rdparty" / "tvm" / "build"))
     elif not prepared:
         recorder.run([str(python), "-m", "pip", "install", "--no-deps", "-e", ".", "-v"], cwd=source, env={"MANUAL_BUILD": "1"})
