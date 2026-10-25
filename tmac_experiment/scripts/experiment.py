@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import traceback
 
@@ -83,24 +84,44 @@ class Recorder:
         merged_env = os.environ.copy()
         if env:
             merged_env.update({str(k): str(v) for k, v in env.items()})
-        completed = subprocess.run(command, cwd=cwd, env=merged_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        elapsed = time.monotonic() - started
-        output = completed.stdout or ""
+        process = subprocess.Popen(command, cwd=cwd, env=merged_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+        output_parts = []
+        timed_out = False
         with open(self.log_path, "a", encoding="utf-8") as handle:
-            handle.write(output)
-        self.commands.append({"command": rendered, "cwd": str(cwd or os.getcwd()), "seconds": elapsed, "exit_code": completed.returncode})
-        if check and completed.returncode:
-            raise subprocess.CalledProcessError(completed.returncode, command, output=output)
-        if not capture and output:
-            print(output, end="", flush=True)
+            def consume_output():
+                for line in process.stdout:
+                    output_parts.append(line)
+                    handle.write(line)
+                    handle.flush()
+                    if not capture:
+                        print(line, end="", flush=True)
+            reader = threading.Thread(target=consume_output)
+            reader.start()
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+                process.wait()
+            reader.join()
+        process.stdout.close()
+        returncode = process.returncode
+        elapsed = time.monotonic() - started
+        output = "".join(output_parts)
+        self.commands.append({"command": rendered, "cwd": str(cwd or os.getcwd()), "seconds": elapsed, "exit_code": returncode})
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, timeout, output=output)
+        completed = subprocess.CompletedProcess(command, returncode, output, None)
+        if check and returncode:
+            raise subprocess.CalledProcessError(returncode, command, output=output)
         return completed
 
 
-def command_version(command):
-    path = shutil.which(command)
+def command_version(command, env=None):
+    path = shutil.which(command, path=(env or os.environ).get("PATH"))
     if not path:
         return {"path": None, "version": None}
-    completed = subprocess.run([path, "--version"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    completed = subprocess.run([path, "--version"], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return {"path": os.path.realpath(path), "version": (completed.stdout or "").splitlines()[:2]}
 
 
@@ -118,6 +139,44 @@ def verify_source(config, source):
     return {"tmac": head, "submodules": actual}
 
 
+def git_has_commit(repository, commit):
+    if not repository.is_dir():
+        return False
+    completed = subprocess.run(["git", "cat-file", "-e", "{}^{{commit}}".format(commit)], cwd=repository, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return completed.returncode == 0
+
+
+def run_git_network(recorder, command, cwd, attempts=3, timeout=180):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        recorder.log("git network attempt {}/{}".format(attempt, attempts))
+        try:
+            completed = recorder.run(command, cwd=cwd, timeout=timeout, check=False)
+            if completed.returncode == 0:
+                return
+            last_error = subprocess.CalledProcessError(completed.returncode, command, output=completed.stdout)
+        except subprocess.TimeoutExpired as error:
+            last_error = error
+            recorder.log("git command timed out after {} seconds".format(timeout))
+        if attempt < attempts:
+            time.sleep(attempt * 2)
+    raise RuntimeError("git command failed after {} attempts: {}".format(attempts, last_error))
+
+
+def prepare_submodules(config, recorder, source):
+    recorder.run(["git", "submodule", "sync", "--recursive"], cwd=source)
+    for relative, commit in config["source"]["submodules"].items():
+        repository = source / relative
+        if git_has_commit(repository, commit):
+            recorder.log("reuse local submodule commit {} at {}".format(commit, relative))
+        else:
+            recorder.log("submodule commit {} is missing at {}; downloading it".format(commit, relative))
+            run_git_network(recorder, ["git", "-c", "http.version=HTTP/1.1", "submodule", "update", "--init", "--recursive", "--", relative], source)
+        if not git_has_commit(repository, commit):
+            raise RuntimeError("submodule {} does not contain required commit {}".format(relative, commit))
+        recorder.run(["git", "checkout", "--detach", commit], cwd=repository)
+
+
 def apply_patch(recorder, source):
     patch = EXPERIMENT_DIR / "patches" / "0001-kunpeng-device.patch"
     reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch)], cwd=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -128,20 +187,154 @@ def apply_patch(recorder, source):
     recorder.run(["git", "apply", str(patch)], cwd=source)
 
 
+def prepend_path(value, current):
+    parts = [str(value)]
+    if current:
+        parts.append(current)
+    return os.pathsep.join(parts)
+
+
+def llvm_candidates(source, environ=None):
+    environ = os.environ if environ is None else environ
+    candidates = []
+    configured = environ.get("TMAC_LLVM_ROOT")
+    if configured:
+        candidates.append(pathlib.Path(configured))
+    build = source / "build"
+    if build.is_dir():
+        candidates.extend(sorted(build.glob("clang+llvm-17.0.6-*")))
+    llvm_config = shutil.which("llvm-config", path=environ.get("PATH"))
+    if llvm_config:
+        candidates.append(pathlib.Path(llvm_config).resolve().parent.parent)
+    result = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return result
+
+
+def command_output(command, env=None):
+    completed = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return completed.returncode, (completed.stdout or "").strip()
+
+
+def validate_llvm_root(root):
+    binary = root / "bin"
+    required = [binary / "clang", binary / "clang++", binary / "llvm-config"]
+    if not all(path.is_file() and os.access(path, os.X_OK) for path in required):
+        return False, "missing clang, clang++, or llvm-config under {}".format(binary)
+    versions = {}
+    for path in required:
+        returncode, output = command_output([str(path), "--version"])
+        versions[path.name] = output.splitlines()[0] if output else ""
+        if returncode:
+            return False, "{} --version failed: {}".format(path, output)
+    llvm_version = versions["llvm-config"]
+    if llvm_version != "17.0.6":
+        return False, "llvm-config version {} is not the pinned 17.0.6".format(llvm_version)
+    if "17.0.6" not in versions["clang"] or "17.0.6" not in versions["clang++"]:
+        return False, "clang and clang++ do not report pinned version 17.0.6"
+    return True, versions
+
+
+def find_llvm_root(source):
+    diagnostics = []
+    for candidate in llvm_candidates(source):
+        valid, detail = validate_llvm_root(candidate)
+        if valid:
+            return candidate, detail
+        diagnostics.append("{}: {}".format(candidate, detail))
+    return None, diagnostics
+
+
+def tvm_library_paths(source):
+    build = source / "3rdparty" / "tvm" / "build"
+    patterns = ["libtvm.so", "libtvm.dylib", "tvm.dll", "libtvm_runtime.so", "libtvm_runtime.dylib", "tvm_runtime.dll"]
+    return [build / name for name in patterns if (build / name).is_file()]
+
+
+def source_environment(source, llvm_root=None, base_env=None):
+    base_env = os.environ if base_env is None else base_env
+    if llvm_root is None:
+        llvm_root, diagnostics = find_llvm_root(source)
+        if llvm_root is None:
+            raise RuntimeError("compatible LLVM 17.0.6 was not found: {}".format("; ".join(diagnostics) or "no candidates"))
+    tvm = source / "3rdparty" / "tvm"
+    values = {
+        "TVM_ROOT": str(tvm),
+        "PATH": prepend_path(llvm_root / "bin", base_env.get("PATH", "")),
+        "PYTHONPATH": prepend_path(tvm / "python", base_env.get("PYTHONPATH", "")),
+        "TMAC_LLVM_ROOT": str(llvm_root),
+    }
+    library_parts = [str(llvm_root / "lib"), str(tvm / "build")]
+    if base_env.get("LD_LIBRARY_PATH"):
+        library_parts.append(base_env["LD_LIBRARY_PATH"])
+    values["LD_LIBRARY_PATH"] = os.pathsep.join(library_parts)
+    if platform.system() == "Darwin":
+        dyld_parts = [str(llvm_root / "lib"), str(tvm / "build")]
+        if base_env.get("DYLD_LIBRARY_PATH"):
+            dyld_parts.append(base_env["DYLD_LIBRARY_PATH"])
+        values["DYLD_LIBRARY_PATH"] = os.pathsep.join(dyld_parts)
+    return values
+
+
+def validate_tvm_build(recorder, source, python, runtime_env):
+    libraries = tvm_library_paths(source)
+    if not any(path.name.startswith("libtvm.") or path.name == "tvm.dll" for path in libraries):
+        raise RuntimeError("TVM build library is missing under {}".format(source / "3rdparty" / "tvm" / "build"))
+    config = source / "3rdparty" / "tvm" / "build" / "config.cmake"
+    llvm_config = pathlib.Path(runtime_env["TMAC_LLVM_ROOT"]) / "bin" / "llvm-config"
+    if not config.is_file() or str(llvm_config) not in config.read_text(encoding="utf-8", errors="replace"):
+        raise RuntimeError("TVM config.cmake does not reference the validated llvm-config: {}".format(llvm_config))
+    recorder.run([str(python), "-c", "import t_mac, tvm; print('t_mac=' + t_mac.__file__); print('tvm=' + tvm.__version__); print('tvm_python=' + tvm.__file__)"], cwd=source, env=runtime_env)
+
+
+def build_tvm_with_existing_llvm(recorder, source, llvm_root):
+    tvm = source / "3rdparty" / "tvm"
+    build = tvm / "build"
+    build.mkdir(parents=True, exist_ok=True)
+    config = build / "config.cmake"
+    if not config.exists():
+        shutil.copy2(tvm / "cmake" / "config.cmake", config)
+    llvm_config = llvm_root / "bin" / "llvm-config"
+    setting = "set(USE_LLVM {})".format(llvm_config)
+    content = config.read_text(encoding="utf-8")
+    if setting not in content:
+        with open(config, "a", encoding="utf-8") as handle:
+            handle.write("\n" + setting + "\n")
+    runtime_env = source_environment(source, llvm_root)
+    recorder.log("building pinned TVM with the already validated LLVM 17.0.6 toolchain")
+    recorder.run(["cmake", ".."], cwd=build, env=runtime_env)
+    recorder.run(["cmake", "--build", ".", "-j", "4"], cwd=build, env=runtime_env)
+
+
+def missing_preinstall_commands(path=None):
+    return [name for name in ["git", "cmake", "make"] if not shutil.which(name, path=path)]
+
+
 def setup(config, recorder):
     root = pathlib.Path(config["paths"]["tmac_root"])
     source = root / "source"
     root.mkdir(parents=True, exist_ok=True)
     if not source.exists():
-        recorder.run(["git", "clone", "--recursive", config["source"]["url"], str(source)])
-    recorder.run(["git", "fetch", "origin", config["source"]["commit"]], cwd=source)
-    recorder.run(["git", "checkout", "--detach", config["source"]["commit"]], cwd=source)
-    recorder.run(["git", "submodule", "sync", "--recursive"], cwd=source)
-    recorder.run(["git", "submodule", "update", "--init", "--recursive"], cwd=source)
+        run_git_network(recorder, ["git", "-c", "http.version=HTTP/1.1", "clone", "--no-checkout", config["source"]["url"], str(source)], root)
+    target_commit = config["source"]["commit"]
+    if git_has_commit(source, target_commit):
+        recorder.log("reuse local T-MAC commit {} and skip fetch".format(target_commit))
+    else:
+        recorder.log("T-MAC commit {} is missing locally; fetching it".format(target_commit))
+        run_git_network(recorder, ["git", "-c", "http.version=HTTP/1.1", "fetch", "origin", target_commit], source)
+    if not git_has_commit(source, target_commit):
+        raise RuntimeError("T-MAC repository does not contain required commit {}".format(target_commit))
+    recorder.run(["git", "checkout", "--detach", target_commit], cwd=source)
+    prepare_submodules(config, recorder, source)
     commits = verify_source(config, source)
     apply_patch(recorder, source)
 
-    missing = [name for name in ["git", "cmake", "make", "clang", "clang++"] if not shutil.which(name)]
+    missing = missing_preinstall_commands()
     if shutil.which("pkg-config"):
         for package in ["zlib", "libzstd", "libxml-2.0"]:
             if subprocess.run(["pkg-config", "--exists", package]).returncode:
@@ -154,26 +347,61 @@ def setup(config, recorder):
         raise RuntimeError("missing prerequisites: {}. Install them in a user directory and override PATH; do not replace system libraries".format(", ".join(missing)))
 
     venv = root / "venv"
+    venv_created = False
     if not (venv / "bin" / "python").exists():
         recorder.run([sys.executable, "-m", "venv", str(venv)])
+        venv_created = True
     python = venv / "bin" / "python"
-    env = {"MANUAL_BUILD": "0"}
+    install_env = {"MANUAL_BUILD": "0"}
     stamp = root / ".setup-fingerprint"
     current = fingerprint(config, commits)
-    if not stamp.exists() or stamp.read_text().strip() != current:
-        recorder.run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=source, env=env)
-        recorder.run([str(python), "-m", "pip", "install", "-r", "requirements-codegen.txt"], cwd=source, env=env)
-        recorder.run([str(python), "-m", "pip", "install", "-e", ".", "-v"], cwd=source, env=env)
-        stamp.write_text(current + "\n")
-    runtime_env = source_environment(source)
-    recorder.run([str(python), "-c", "import t_mac, tvm; print(tvm.__version__)"], cwd=source, env=runtime_env)
+    llvm_root, llvm_detail = find_llvm_root(source)
+    libraries = tvm_library_paths(source)
+    editable_installed = subprocess.run([str(python), "-m", "pip", "show", "t-mac"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    prepared = not venv_created and editable_installed and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == current and llvm_root is not None and bool(libraries)
+    if prepared:
+        recorder.log("setup fingerprint and build artifacts match; skipping dependency download and rebuild")
+    else:
+        if stamp.exists():
+            stamp.unlink()
+        recorder.run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=source)
+        recorder.run([str(python), "-m", "pip", "install", "-r", "requirements-codegen.txt"], cwd=source)
+    if llvm_root is not None:
+        recorder.log("reusing validated LLVM toolchain {}: {}".format(llvm_root, llvm_detail))
+    else:
+        recorder.log("no validated LLVM 17.0.6 toolchain found before install: {}".format("; ".join(llvm_detail) or "no candidates"))
+    if not prepared and llvm_root is not None and not libraries:
+        build_tvm_with_existing_llvm(recorder, source, llvm_root)
+        libraries = tvm_library_paths(source)
+    if not prepared and llvm_root is None:
+        recorder.log("running pinned T-MAC editable install with its official LLVM 17.0.6 and TVM build hook")
+        recorder.run([str(python), "-m", "pip", "install", "--no-deps", "--force-reinstall", "-e", ".", "-v"], cwd=source, env=install_env)
+        llvm_root, llvm_detail = find_llvm_root(source)
+        libraries = tvm_library_paths(source)
+        if llvm_root is None or not libraries:
+            recorder.log("editable install did not execute or complete the pinned build_py hook; invoking that official hook explicitly")
+            recorder.run([str(python), "setup.py", "build_py"], cwd=source, env=install_env)
+            llvm_root, llvm_detail = find_llvm_root(source)
+            libraries = tvm_library_paths(source)
+        if llvm_root is None:
+            raise RuntimeError("official build hook returned but did not produce a validated LLVM 17.0.6 toolchain: {}".format("; ".join(llvm_detail) or "no candidates"))
+        if not libraries:
+            raise RuntimeError("official build hook returned but did not produce TVM shared libraries under {}".format(source / "3rdparty" / "tvm" / "build"))
+    elif not prepared:
+        recorder.run([str(python), "-m", "pip", "install", "--no-deps", "-e", ".", "-v"], cwd=source, env={"MANUAL_BUILD": "1"})
+
+    runtime_env = source_environment(source, llvm_root)
+    for command in ["clang", "clang++", "llvm-config"]:
+        recorder.run([command, "--version"], cwd=source, env=runtime_env)
+    validate_tvm_build(recorder, source, python, runtime_env)
     smoke_source = root / "loader-smoke.cpp"
     smoke_binary = root / "loader-smoke"
     smoke_source.write_text("#include <iostream>\nint main() { std::cout << \"runtime smoke test passed\\n\"; }\n", encoding="ascii")
-    recorder.run(["clang++", "-std=c++17", str(smoke_source), "-o", str(smoke_binary)], cwd=root)
+    recorder.run(["clang++", "-std=c++17", str(smoke_source), "-o", str(smoke_binary)], cwd=root, env=runtime_env)
     recorder.run([str(smoke_binary)], cwd=root, env=runtime_env)
     if shutil.which("ldd"):
         recorder.run(["ldd", str(smoke_binary)], cwd=root, env=runtime_env)
+    stamp.write_text(current + "\n", encoding="ascii")
     recorder.log("setup completed with exact source commits: {}".format(commits))
 
 
@@ -188,19 +416,6 @@ def parse_cpu_list(text):
         else:
             cpus.append(int(part))
     return cpus
-
-
-def source_environment(source):
-    tvm = source / "3rdparty" / "tvm"
-    values = {
-        "TVM_ROOT": str(tvm),
-        "PYTHONPATH": str(tvm / "python"),
-    }
-    library_parts = [str(tvm / "build")]
-    if os.environ.get("LD_LIBRARY_PATH"):
-        library_parts.append(os.environ["LD_LIBRARY_PATH"])
-    values["LD_LIBRARY_PATH"] = os.pathsep.join(library_parts)
-    return values
 
 
 def physical_cpus(node):
@@ -441,11 +656,18 @@ def run_model_benchmarks(config, recorder, builds, deadline, kcfg):
     return rows, dispatch, False
 
 
-def environment_text(config, cpus):
+def environment_text(config, cpus, source=None):
     allowed = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
     lines = ["platform=" + platform.platform(), "python=" + sys.version.replace("\n", " "), "allowed_cpus=" + ",".join(map(str, allowed)), "selected_physical_cpus=" + ",".join(map(str, cpus))]
+    runtime_env = None
+    if source is not None:
+        try:
+            runtime_env = os.environ.copy()
+            runtime_env.update(source_environment(source))
+        except RuntimeError as error:
+            lines.append("runtime_environment_error=" + str(error))
     for command in ["cc", "c++", "gcc", "g++", "clang", "clang++", "cmake", "ldd", "numactl", "taskset"]:
-        lines.append("{}={}".format(command, json.dumps(command_version(command), ensure_ascii=True)))
+        lines.append("{}={}".format(command, json.dumps(command_version(command, runtime_env), ensure_ascii=True)))
     for path in ["/proc/cpuinfo", "/proc/meminfo", "/proc/self/status"]:
         try:
             lines.append("\n===== {} =====\n{}".format(path, pathlib.Path(path).read_text(errors="replace")))
@@ -543,7 +765,7 @@ def baseline(config, recorder, result_dir):
         write_csv(result_dir / "end_to_end.csv", ["variant", "phase", "threads", "round", "exit_code", "tokens_per_second", "stddev", "command"], model_rows)
         (result_dir / "dispatch.json").write_text(json.dumps(dispatch, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         cpus = physical_cpus(config["model_benchmark"]["numa_node"])
-        (result_dir / "environment.txt").write_text(environment_text(config, cpus), encoding="utf-8")
+        (result_dir / "environment.txt").write_text(environment_text(config, cpus, source), encoding="utf-8")
         patch_path = EXPERIMENT_DIR / "patches" / "0001-kunpeng-device.patch"
         manifest = {"status": "partial" if blocking else "complete", "started_at": run_started_at, "elapsed_seconds": time.monotonic() - started, "tuning_seconds": tune_seconds, "timed_out": timed_out, "source": commits, "adaptation": {"reason": "Add a named Linux AArch64 ARMv8.2+FP16 compile target; no algorithm code changes", "patch_sha256": sha256_file(patch_path), "diff": patch_path.read_text(encoding="utf-8")}, "generated_artifacts": generated_artifacts, "model_sha256": sha256_file(config["paths"]["model"]) if pathlib.Path(config["paths"]["model"]).is_file() else None, "dimension_mapping": {"T": "T-MAC N; fixed fork invokes generated N=1 kernel once per token", "O": "logical output channels; compile.py passes O*bits as QGeMMLUTBitsCodegen M", "K": "T-MAC K"}, "repeated_n1_source": {"file": "3rdparty/llama.cpp/ggml/src/ggml.c", "init_loop_line": 12586, "compute_loop_lines": [12613, 12680], "commit": commits.get("submodules", {}).get("3rdparty/llama.cpp")}, "commands": recorder.commands, "blocking": blocking}
         (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
