@@ -60,7 +60,7 @@ def fingerprint(config, source):
     payload = {
         "config": config,
         "source": source,
-        "patch": sha256_file(EXPERIMENT_DIR / "patches" / "0001-kunpeng-device.patch"),
+        "patches": {path.name: sha256_file(path) for path in sorted((EXPERIMENT_DIR / "patches").glob("*.patch"))},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -125,18 +125,46 @@ def command_version(command, env=None):
     return {"path": os.path.realpath(path), "version": (completed.stdout or "").splitlines()[:2]}
 
 
+def gitlink_commit(repository, revision, path):
+    output = subprocess.check_output(["git", "ls-tree", revision, "--", path], cwd=repository, text=True).strip()
+    fields = output.split(None, 3)
+    if len(fields) != 4 or fields[0] != "160000" or fields[1] != "commit":
+        raise RuntimeError("{} is not a gitlink in {} at {}".format(path, repository, revision))
+    return fields[2]
+
+
+def verify_submodule_set(repository, revision, required, skipped):
+    actual = {}
+    skipped_actual = {}
+    for path, commit in required.items():
+        pinned = gitlink_commit(repository, revision, path)
+        if pinned != commit:
+            raise RuntimeError("gitlink {} mismatch: expected {}, got {}".format(path, commit, pinned))
+        checkout = repository / path
+        if not git_has_commit(checkout, commit):
+            raise RuntimeError("required submodule {} is not initialized at {}".format(path, commit))
+        value = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+        if value != commit:
+            raise RuntimeError("submodule {} mismatch: expected {}, got {}".format(path, commit, value))
+        actual[path] = value
+    for path, commit in skipped.items():
+        pinned = gitlink_commit(repository, revision, path)
+        if pinned != commit:
+            raise RuntimeError("skipped gitlink {} mismatch: expected {}, got {}".format(path, commit, pinned))
+        skipped_actual[path] = {"commit": pinned, "status": "skipped"}
+    return actual, skipped_actual
+
+
 def verify_source(config, source):
     expected = config["source"]
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
     if head != expected["commit"]:
         raise RuntimeError("T-MAC commit mismatch: expected {}, got {}".format(expected["commit"], head))
-    actual = {}
-    for path, commit in expected["submodules"].items():
-        value = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source / path, text=True).strip()
-        actual[path] = value
-        if value != commit:
-            raise RuntimeError("submodule {} mismatch: expected {}, got {}".format(path, commit, value))
-    return {"tmac": head, "submodules": actual}
+    actual, skipped = verify_submodule_set(source, head, expected["required_submodules"], expected["skipped_submodules"])
+    tvm = source / "3rdparty" / "tvm"
+    tvm_expected = expected["tvm_submodules"]
+    tvm_actual, tvm_skipped = verify_submodule_set(tvm, expected["required_submodules"]["3rdparty/tvm"], tvm_expected["required"], tvm_expected["skipped"])
+    return {"tmac": head, "submodules": actual, "skipped_submodules": skipped, "tvm_submodules": tvm_actual, "skipped_tvm_submodules": tvm_skipped}
 
 
 def git_has_commit(repository, commit):
@@ -163,28 +191,39 @@ def run_git_network(recorder, command, cwd, attempts=3, timeout=180):
     raise RuntimeError("git command failed after {} attempts: {}".format(attempts, last_error))
 
 
-def prepare_submodules(config, recorder, source):
-    recorder.run(["git", "submodule", "sync", "--recursive"], cwd=source)
-    for relative, commit in config["source"]["submodules"].items():
-        repository = source / relative
+def prepare_submodule_set(recorder, parent, submodules):
+    for relative, commit in submodules.items():
+        recorder.run(["git", "submodule", "sync", "--", relative], cwd=parent)
+        repository = parent / relative
         if git_has_commit(repository, commit):
             recorder.log("reuse local submodule commit {} at {}".format(commit, relative))
         else:
             recorder.log("submodule commit {} is missing at {}; downloading it".format(commit, relative))
-            run_git_network(recorder, ["git", "-c", "http.version=HTTP/1.1", "submodule", "update", "--init", "--recursive", "--", relative], source)
+            run_git_network(recorder, ["git", "-c", "http.version=HTTP/1.1", "submodule", "update", "--init", "--", relative], parent)
         if not git_has_commit(repository, commit):
             raise RuntimeError("submodule {} does not contain required commit {}".format(relative, commit))
         recorder.run(["git", "checkout", "--detach", commit], cwd=repository)
 
 
+def prepare_submodules(config, recorder, source):
+    expected = config["source"]
+    prepare_submodule_set(recorder, source, expected["required_submodules"])
+    for relative, commit in expected["skipped_submodules"].items():
+        recorder.log("skip unused submodule {} at pinned gitlink {}".format(relative, commit))
+    tvm = source / "3rdparty" / "tvm"
+    prepare_submodule_set(recorder, tvm, expected["tvm_submodules"]["required"])
+    for relative, commit in expected["tvm_submodules"]["skipped"].items():
+        recorder.log("skip unused TVM submodule {} at pinned gitlink {}".format(relative, commit))
+
+
 def apply_patch(recorder, source):
-    patch = EXPERIMENT_DIR / "patches" / "0001-kunpeng-device.patch"
-    reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch)], cwd=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if reverse.returncode == 0:
-        recorder.log("Kunpeng adaptation patch is already applied")
-        return
-    recorder.run(["git", "apply", "--check", str(patch)], cwd=source)
-    recorder.run(["git", "apply", str(patch)], cwd=source)
+    for patch in sorted((EXPERIMENT_DIR / "patches").glob("*.patch")):
+        reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch)], cwd=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if reverse.returncode == 0:
+            recorder.log("adaptation patch {} is already applied".format(patch.name))
+            continue
+        recorder.run(["git", "apply", "--check", str(patch)], cwd=source)
+        recorder.run(["git", "apply", str(patch)], cwd=source)
 
 
 def prepend_path(value, current):

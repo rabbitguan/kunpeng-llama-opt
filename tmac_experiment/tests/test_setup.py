@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import stat
@@ -5,10 +6,24 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from experiment import Recorder, find_llvm_root, git_has_commit, missing_preinstall_commands, run_git_network, source_environment
+from experiment import Recorder, find_llvm_root, git_has_commit, missing_preinstall_commands, prepare_submodules, run_git_network, source_environment
+
+
+class RecordingRunner:
+    def __init__(self):
+        self.commands = []
+        self.messages = []
+
+    def run(self, command, cwd=None, **kwargs):
+        self.commands.append((list(command), pathlib.Path(cwd)))
+        return subprocess.CompletedProcess(command, 0, "", None)
+
+    def log(self, message):
+        self.messages.append(message)
 
 
 class SetupTest(unittest.TestCase):
@@ -90,6 +105,36 @@ class SetupTest(unittest.TestCase):
                 recorder.run([sys.executable, "-c", "import time; print('before-timeout', flush=True); time.sleep(5)"], timeout=0.1, capture=True)
             log = (pathlib.Path(directory) / "console.log").read_text(encoding="utf-8")
             self.assertIn("before-timeout", log)
+
+    def test_only_required_submodules_are_prepared_without_recursion(self):
+        config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        recorder = RecordingRunner()
+        source = pathlib.Path("/source")
+        with mock.patch("experiment.git_has_commit", return_value=True):
+            prepare_submodules(config, recorder, source)
+        rendered = [" ".join(command) for command, _ in recorder.commands]
+        self.assertFalse(any("--recursive" in command for command in rendered))
+        self.assertFalse(any("executorch" in command for command in rendered))
+        self.assertFalse(any("FACTO" in command for command in rendered))
+        self.assertFalse(any("Vulkan" in command for command in rendered))
+        expected = {"3rdparty/llama.cpp", "3rdparty/tvm", "3rdparty/dlpack", "3rdparty/dmlc-core", "3rdparty/rang"}
+        synced = {command[-1] for command, _ in recorder.commands if command[:3] == ["git", "submodule", "sync"]}
+        self.assertEqual(synced, expected)
+        messages = "\n".join(recorder.messages)
+        self.assertIn("skip unused submodule t-man/executorch", messages)
+        self.assertIn("skip unused TVM submodule 3rdparty/cutlass", messages)
+        self.assertIn("skip unused TVM submodule 3rdparty/flashinfer", messages)
+
+    def test_official_build_hook_patch_cannot_download_submodules(self):
+        patch_path = pathlib.Path(__file__).resolve().parents[1] / "patches" / "0002-selective-submodules.patch"
+        content = patch_path.read_text(encoding="utf-8")
+        added = "\n".join(line[1:] for line in content.splitlines() if line.startswith("+") and not line.startswith("+++"))
+        self.assertNotIn("submodule update", added)
+        self.assertNotIn("--recursive", added)
+        self.assertNotIn("executorch", added)
+        self.assertNotIn("FACTO", added)
+        self.assertNotIn("Vulkan", added)
 
 
 if __name__ == "__main__":

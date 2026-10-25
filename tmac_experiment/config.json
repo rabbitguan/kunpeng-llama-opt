@@ -10,10 +10,29 @@
   "source": {
     "url": "https://github.com/microsoft/T-MAC.git",
     "commit": "7042f8f73330bd083bc1e4bc5ccb3f88a4904aee",
-    "submodules": {
+    "required_submodules": {
       "3rdparty/llama.cpp": "eb07ecf0172230d58fff5d23a3fd6feebda35065",
-      "3rdparty/tvm": "36b9535ff364c484d04b384555106731049f44cd",
+      "3rdparty/tvm": "36b9535ff364c484d04b384555106731049f44cd"
+    },
+    "skipped_submodules": {
       "t-man/executorch": "817bd29dfbea4979a27f2f539c753bd46757ea7a"
+    },
+    "tvm_submodules": {
+      "required": {
+        "3rdparty/dlpack": "e2bdd3bee8cb6501558042633fa59144cc8b7f5f",
+        "3rdparty/dmlc-core": "3031e4a61a98f49f07a42cfdec6242340fb2fd8c",
+        "3rdparty/rang": "cabe04d6d6b05356fa8f9741704924788f0dd762"
+      },
+      "skipped": {
+        "3rdparty/vta-hw": "36a91576edf633479c78649e050f18dd2ddc8103",
+        "3rdparty/libbacktrace": "08f7c7e69f8ea61a0c4151359bc8023be8e9217b",
+        "3rdparty/cutlass": "bbe579a9e3beb6ea6626d9227ec32d0dae119a49",
+        "3rdparty/OpenCL-Headers": "b590a6bfe034ea3a418b7b523e3490956bcb367a",
+        "3rdparty/cnpy": "4e8810b1a8637695171ed346ce68f6984e585ef4",
+        "3rdparty/cutlass_fpA_intB_gemm": "038d142cea8c2604268319a69bf045424183ff87",
+        "3rdparty/libflash_attn": "07ba35bae96900e51b4d63ef3487ba24850da870",
+        "3rdparty/flashinfer": "7e9cc7ff42ca283c317061a877305d09a395fad2"
+      }
     }
   },
   "quantization": {

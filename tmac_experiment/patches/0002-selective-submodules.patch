@@ -1,0 +1,25 @@
+diff --git a/setup.py b/setup.py
+index 29f3e17..703a093 100644
+--- a/setup.py
++++ b/setup.py
+@@ -89,7 +89,15 @@
+ def update_submodules():
+-    """Updates git submodules."""
+-    try:
+-        subprocess.check_call(["git", "submodule", "update", "--init", "--recursive"])
+-    except subprocess.CalledProcessError as error:
+-        raise RuntimeError("Failed to update submodules") from error
++    """Checks the submodules prepared by the experiment setup."""
++    required = {
++        ".": ["3rdparty/llama.cpp", "3rdparty/tvm"],
++        "3rdparty/tvm": ["3rdparty/dlpack", "3rdparty/dmlc-core", "3rdparty/rang"],
++    }
++    for repository, paths in required.items():
++        for path in paths:
++            try:
++                status = subprocess.check_output(["git", "-C", repository, "submodule", "status", "--", path], text=True).rstrip()
++            except subprocess.CalledProcessError as error:
++                raise RuntimeError(f"Failed to check required submodule {repository}/{path}") from error
++            if not status or status[0] != " ":
++                raise RuntimeError(f"Required submodule {repository}/{path} is missing or not at its pinned commit")
+ 
