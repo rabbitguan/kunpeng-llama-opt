@@ -42,6 +42,10 @@ DEPENDENCY_SPECS = {
     "xml2": {"flag": "-lxml2", "source": "#include <libxml/parser.h>\nint main() { xmlDocPtr d = xmlReadMemory(\"<a/>\", 4, 0, 0, 0); if (!d) return 1; xmlFreeDoc(d); return 0; }\n", "pkg": "libxml-2.0"},
     "tinfo": {"flag": "-ltinfo", "source": "#include <curses.h>\n#include <term.h>\nint main() { int error = 0; (void)setupterm(0, 1, &error); return 0; }\n", "pkg": "tinfo"},
 }
+TINFO_BUILD_RECIPE = {
+    "revision": 2,
+    "configure": ["--disable-widec", "--with-shared", "--with-termlib=tinfo", "--with-pic", "--without-debug", "--without-ada", "--without-cxx-binding", "--enable-pc-files"],
+}
 
 
 def load_config(path, overrides):
@@ -472,9 +476,10 @@ def llvm_config_report(recorder, llvm_root, tvm=None):
 def dependency_environment(prefix, base_env=None):
     base_env = os.environ if base_env is None else base_env
     lib_dirs = [prefix / "lib", prefix / "lib64"]
+    include_dirs = [prefix / "include", prefix / "include" / "ncurses"]
     values = {
         "CMAKE_PREFIX_PATH": prepend_path(prefix, base_env.get("CMAKE_PREFIX_PATH", "")),
-        "CPATH": prepend_path(prefix / "include", base_env.get("CPATH", "")),
+        "CPATH": os.pathsep.join([str(path) for path in include_dirs] + ([base_env["CPATH"]] if base_env.get("CPATH") else [])),
         "LIBRARY_PATH": os.pathsep.join([str(path) for path in lib_dirs] + ([base_env["LIBRARY_PATH"]] if base_env.get("LIBRARY_PATH") else [])),
         "LD_LIBRARY_PATH": os.pathsep.join([str(path) for path in lib_dirs] + ([base_env["LD_LIBRARY_PATH"]] if base_env.get("LD_LIBRARY_PATH") else [])),
         "PKG_CONFIG_PATH": os.pathsep.join([str(prefix / "lib" / "pkgconfig"), str(prefix / "lib64" / "pkgconfig"), str(prefix / "share" / "pkgconfig")] + ([base_env["PKG_CONFIG_PATH"]] if base_env.get("PKG_CONFIG_PATH") else [])),
@@ -489,7 +494,108 @@ def pkg_config_flags(package, env, option="--cflags"):
     return shlex.split(completed.stdout) if completed.returncode == 0 else []
 
 
-def probe_dependency(recorder, name, compiler, env, work):
+def path_is_within(path, directory):
+    try:
+        pathlib.Path(path).resolve().relative_to(pathlib.Path(directory).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def tinfo_prefix_inventory(prefix):
+    patterns = ["curses.h", "term.h", "ncurses*.pc", "tinfo*.pc", "libtinfo*"]
+    return {pattern: [str(path) for path in sorted(prefix.rglob(pattern))] for pattern in patterns}
+
+
+def local_pkg_config_environment(prefix, env):
+    result = env.copy()
+    directories = [prefix / "lib" / "pkgconfig", prefix / "lib64" / "pkgconfig", prefix / "share" / "pkgconfig"]
+    value = os.pathsep.join(str(path) for path in directories)
+    result["PKG_CONFIG_PATH"] = value
+    result["PKG_CONFIG_LIBDIR"] = value
+    return result
+
+
+def tinfo_pkg_config(prefix, env):
+    inventory = tinfo_prefix_inventory(prefix)
+    local_env = local_pkg_config_environment(prefix, env)
+    if not shutil.which("pkg-config", path=local_env.get("PATH")):
+        return {"inventory": inventory, "pkg_config": {}, "pc_file": None, "header_dir": None, "cflags": [], "ldflags": [], "errors": ["pkg-config is not available"], "env": local_env}
+    records = {}
+    for option in ["--variable=pcfiledir", "--cflags", "--libs"]:
+        returncode, stdout, stderr = command_output(["pkg-config", option, "tinfo"], env=local_env)
+        records[option] = {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+    pc_directory = pathlib.Path(records["--variable=pcfiledir"]["stdout"]) if records["--variable=pcfiledir"]["stdout"] else None
+    pc_file = pc_directory / "tinfo.pc" if pc_directory else None
+    errors = []
+    for option, record in records.items():
+        if record["returncode"]:
+            errors.append("pkg-config {} tinfo failed: {}".format(option, record["stderr"] or record["stdout"]))
+    if not pc_file or not pc_file.is_file() or not path_is_within(pc_file, prefix):
+        errors.append("project-local tinfo.pc was not selected")
+    common_headers = []
+    curses_dirs = {pathlib.Path(path).parent.resolve() for path in inventory["curses.h"]}
+    term_dirs = {pathlib.Path(path).parent.resolve() for path in inventory["term.h"]}
+    for directory in sorted(curses_dirs & term_dirs):
+        if path_is_within(directory, prefix):
+            common_headers.append(directory)
+    if not common_headers:
+        errors.append("curses.h and term.h were not found in the same project-local include directory")
+    cflags = shlex.split(records["--cflags"]["stdout"])
+    if common_headers and "-I{}".format(common_headers[0]) not in cflags:
+        cflags.append("-I{}".format(common_headers[0]))
+    return {
+        "inventory": inventory,
+        "pkg_config": records,
+        "pc_file": str(pc_file) if pc_file else None,
+        "header_dir": str(common_headers[0]) if common_headers else None,
+        "cflags": cflags,
+        "ldflags": shlex.split(records["--libs"]["stdout"]),
+        "errors": errors,
+        "env": local_env,
+    }
+
+
+def probe_local_tinfo(recorder, compiler, env, work, prefix):
+    metadata = tinfo_pkg_config(prefix, env)
+    result = {key: value for key, value in metadata.items() if key != "env"}
+    recorder.log("tinfo project-local inventory: {}".format(json.dumps(metadata["inventory"], sort_keys=True)))
+    recorder.log("tinfo pkg-config selection: pc_file={} cflags={} libs={}".format(metadata["pc_file"], shlex.join(metadata["cflags"]), shlex.join(metadata["ldflags"])))
+    if metadata["errors"]:
+        result.update({"status": "failed", "stage": "pkg_config", "compile_output": "; ".join(metadata["errors"])})
+        return result
+    source_file = work / "probe-tinfo.c"
+    binary = work / "probe-tinfo"
+    source_file.write_text(DEPENDENCY_SPECS["tinfo"]["source"], encoding="ascii")
+    library_dirs = [pathlib.Path(flag[2:]) for flag in metadata["ldflags"] if flag.startswith("-L")]
+    local_library_dirs = [path for path in library_dirs if path_is_within(path, prefix)]
+    if not local_library_dirs:
+        result.update({"status": "failed", "stage": "pkg_config", "compile_output": "tinfo.pc did not provide a project-local library directory"})
+        return result
+    rpaths = ["-Wl,-rpath,{}".format(path) for path in local_library_dirs]
+    command = [str(compiler)] + metadata["cflags"] + [str(source_file)] + metadata["ldflags"] + rpaths + ["-o", str(binary)]
+    compiled = recorder.run(command, env=metadata["env"], check=False, capture=True)
+    result.update({"compile_command": shlex.join(command), "compile_returncode": compiled.returncode, "compile_output": compiled.stdout})
+    if compiled.returncode:
+        result.update({"status": "failed", "stage": "compile_link"})
+        return result
+    linker = ["ldd", str(binary)]
+    link_returncode, link_stdout, link_stderr = command_output(linker, env=metadata["env"])
+    result["dynamic_libraries"] = {"command": shlex.join(linker), "returncode": link_returncode, "stdout": link_stdout, "stderr": link_stderr}
+    tinfo_lines = [line for line in link_stdout.splitlines() if "libtinfo" in line]
+    if link_returncode or not tinfo_lines or any(str(prefix.resolve()) not in line for line in tinfo_lines):
+        result.update({"status": "failed", "stage": "dynamic_library", "run_output": link_stderr or link_stdout or "project-local libtinfo was not resolved"})
+        return result
+    run_returncode, run_stdout, run_stderr = command_output([str(binary)], env=metadata["env"])
+    if run_stderr:
+        recorder.log("tinfo runtime stderr warning: {}".format(run_stderr))
+    result.update({"run_returncode": run_returncode, "run_stdout": run_stdout, "run_stderr": run_stderr, "run_output": "\n".join(part for part in [run_stdout, run_stderr] if part), "status": "pass" if run_returncode == 0 else "failed", "stage": "run"})
+    return result
+
+
+def probe_dependency(recorder, name, compiler, env, work, prefix=None):
+    if name == "tinfo" and prefix is not None:
+        return probe_local_tinfo(recorder, compiler, env, work, pathlib.Path(prefix))
     spec = DEPENDENCY_SPECS[name]
     source_file = work / "probe-{}.c".format(name)
     binary = work / "probe-{}".format(name)
@@ -579,9 +685,13 @@ def build_vendor_dependency(recorder, name, package, deps_root, prefix, compiler
         recorder.run(["make", "-j4"], cwd=source, env=env)
         recorder.run(["make", "install"], cwd=source, env=env)
     elif name == "tinfo":
-        recorder.run(["./configure", "--prefix={}".format(prefix), "--with-shared", "--with-termlib", "--with-pic", "--without-debug", "--without-ada", "--without-cxx-binding", "--enable-pc-files", "--with-pkg-config-libdir={}".format(prefix / "lib" / "pkgconfig")], cwd=source, env=env)
-        recorder.run(["make", "-j4"], cwd=source, env=env)
-        recorder.run(["make", "install"], cwd=source, env=env)
+        recipe_key = hashlib.sha256(json.dumps(TINFO_BUILD_RECIPE, sort_keys=True).encode()).hexdigest()[:16]
+        build = deps_root / "build" / "ncurses-{}".format(recipe_key)
+        build.mkdir(parents=True, exist_ok=True)
+        configure = [str(source / "configure"), "--prefix={}".format(prefix)] + TINFO_BUILD_RECIPE["configure"] + ["--with-pkg-config-libdir={}".format(prefix / "lib" / "pkgconfig")]
+        recorder.run(configure, cwd=build, env=env)
+        recorder.run(["make", "-j4"], cwd=build, env=env)
+        recorder.run(["make", "install"], cwd=build, env=env)
     else:
         raise RuntimeError("no vendor build recipe for {}".format(name))
 
@@ -589,6 +699,18 @@ def build_vendor_dependency(recorder, name, package, deps_root, prefix, compiler
 def required_llvm_dependencies(report):
     flags = shlex.split(report["system-libs"]["stdout"])
     return [name for name, spec in DEPENDENCY_SPECS.items() if spec["flag"] in flags]
+
+
+def native_dependency_fingerprint(required, manifest, report, toolchain, recipes=None):
+    recipes = {"tinfo": TINFO_BUILD_RECIPE} if recipes is None else recipes
+    payload = {
+        "required": required,
+        "manifest": {name: manifest["packages"][name]["sha256"] for name in required},
+        "llvm": report,
+        "toolchain": toolchain,
+        "recipes": {name: recipes.get(name, {"revision": 1}) for name in required},
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def prepare_native_dependencies(recorder, root, llvm_root, report):
@@ -601,8 +723,7 @@ def prepare_native_dependencies(recorder, root, llvm_root, report):
         stat_result = tool.stat()
         returncode, stdout, stderr = command_output([str(tool), "--version"])
         toolchain[name] = {"path": str(tool.resolve()), "size": stat_result.st_size, "mtime_ns": stat_result.st_mtime_ns, "returncode": returncode, "stdout": stdout, "stderr": stderr}
-    payload = {"required": required, "manifest": {name: manifest["packages"][name]["sha256"] for name in required}, "llvm": report, "toolchain": toolchain}
-    dep_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+    dep_key = native_dependency_fingerprint(required, manifest, report, toolchain)
     deps_root = root / "deps" / dep_key
     prefix = deps_root / "prefix"
     work = deps_root / "checks"
@@ -611,11 +732,12 @@ def prepare_native_dependencies(recorder, root, llvm_root, report):
     system_probe = {name: probe_dependency(recorder, name, compiler_env["CC"], system_env, work) for name in required}
     existing_env = os.environ.copy()
     existing_env.update(dependency_environment(prefix, existing_env))
-    existing_probe = {name: probe_dependency(recorder, name, compiler_env["CC"], existing_env, work) for name in required}
+    existing_probe = {name: probe_dependency(recorder, name, compiler_env["CC"], existing_env, work, prefix=prefix) for name in required}
     missing = [name for name in required if existing_probe[name]["status"] != "pass"]
     if missing:
         recorder.log("native dependencies requiring project-local recovery: {}".format(", ".join(missing)))
-    initial_diagnostic = {"fingerprint": dep_key, "required": required, "system": system_probe, "existing_project": existing_probe, "prefix": str(prefix), "llvm_config": report, "toolchain": toolchain}
+    recipes = {name: TINFO_BUILD_RECIPE if name == "tinfo" else {"revision": 1} for name in required}
+    initial_diagnostic = {"fingerprint": dep_key, "required": required, "recipes": recipes, "system": system_probe, "existing_project": existing_probe, "prefix": str(prefix), "llvm_config": report, "toolchain": toolchain}
     (deps_root / "diagnostics.json").write_text(json.dumps(initial_diagnostic, indent=2) + "\n", encoding="utf-8")
     build_errors = []
     for name in missing:
@@ -625,9 +747,9 @@ def prepare_native_dependencies(recorder, root, llvm_root, report):
             build_errors.append("{}: {}: {}".format(name, type(error).__name__, error))
     final_env = os.environ.copy()
     final_env.update(dependency_environment(prefix, final_env))
-    final = {name: probe_dependency(recorder, name, compiler_env["CC"], final_env, work) for name in required}
+    final = {name: probe_dependency(recorder, name, compiler_env["CC"], final_env, work, prefix=prefix) for name in required}
     failures = build_errors + ["{}: {}: {}".format(name, final[name]["stage"], final[name].get("compile_output") or final[name].get("run_output")) for name in required if final[name]["status"] != "pass"]
-    diagnostic = {"fingerprint": dep_key, "required": required, "system": system_probe, "existing_project": existing_probe, "final": final, "prefix": str(prefix), "llvm_config": report, "toolchain": toolchain}
+    diagnostic = {"fingerprint": dep_key, "required": required, "recipes": recipes, "system": system_probe, "existing_project": existing_probe, "final": final, "prefix": str(prefix), "llvm_config": report, "toolchain": toolchain}
     (deps_root / "diagnostics.json").write_text(json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8")
     if failures:
         raise RuntimeError("native dependency checks failed after local recovery:\n- " + "\n- ".join(failures))

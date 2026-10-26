@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from experiment import Recorder, build_tvm_with_existing_llvm, find_llvm_root, git_has_commit, missing_preinstall_commands, prepare_llvm, prepare_submodules, probe_dependency, run_git_network, setup, source_environment, tvm_build_fingerprint, tvm_config_text, validate_llvm_root, vendor_manifest
+from experiment import TINFO_BUILD_RECIPE, Recorder, build_tvm_with_existing_llvm, build_vendor_dependency, find_llvm_root, git_has_commit, missing_preinstall_commands, native_dependency_fingerprint, prepare_llvm, prepare_submodules, probe_dependency, run_git_network, setup, source_environment, tinfo_pkg_config, tvm_build_fingerprint, tvm_config_text, validate_llvm_root, vendor_manifest
 
 
 class RecordingRunner:
@@ -182,6 +182,79 @@ class SetupTest(unittest.TestCase):
                 result = probe_dependency(recorder, "zlib", compiler, os.environ.copy(), root)
             self.assertEqual(result["status"], "failed")
             self.assertIn("cannot find -lz", result["compile_output"])
+
+    def make_tinfo_prefix(self, root, header_subdir="include/ncurses", pc_name="tinfo.pc"):
+        prefix = root / "prefix"
+        headers = prefix / header_subdir
+        headers.mkdir(parents=True)
+        (headers / "curses.h").write_text("/* test */\n", encoding="ascii")
+        (headers / "term.h").write_text("/* test */\n", encoding="ascii")
+        pc = prefix / "lib" / "pkgconfig"
+        pc.mkdir(parents=True)
+        (pc / pc_name).write_text("prefix={}\nName: tinfo\nVersion: 6.5\nLibs: -L${{prefix}}/lib -ltinfo\nCflags: -I${{prefix}}/include\n".format(prefix), encoding="ascii")
+        return prefix
+
+    def test_tinfo_headers_in_ncurses_subdirectory_are_selected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = self.make_tinfo_prefix(pathlib.Path(directory))
+            outputs = [(0, str(prefix / "lib" / "pkgconfig"), ""), (0, "-I" + str(prefix / "include"), ""), (0, "-L{} -ltinfo".format(prefix / "lib"), "")]
+            with mock.patch("experiment.shutil.which", return_value="/usr/bin/pkg-config"), mock.patch("experiment.command_output", side_effect=outputs):
+                metadata = tinfo_pkg_config(prefix, os.environ.copy())
+            self.assertEqual(metadata["errors"], [])
+            expected = (prefix / "include" / "ncurses").resolve()
+            self.assertEqual(pathlib.Path(metadata["header_dir"]), expected)
+            self.assertIn("-I" + str(expected), metadata["cflags"])
+
+    def test_tinfow_pc_does_not_satisfy_non_wide_tinfo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = self.make_tinfo_prefix(pathlib.Path(directory), pc_name="tinfow.pc")
+            outputs = [(1, "", "Package tinfo was not found"), (1, "", "Package tinfo was not found"), (1, "", "Package tinfo was not found")]
+            with mock.patch("experiment.shutil.which", return_value="/usr/bin/pkg-config"), mock.patch("experiment.command_output", side_effect=outputs):
+                metadata = tinfo_pkg_config(prefix, os.environ.copy())
+            self.assertTrue(metadata["errors"])
+            self.assertIsNone(metadata["pc_file"])
+            self.assertTrue(metadata["inventory"]["tinfo*.pc"])
+
+    def test_tinfo_pkg_config_isolated_from_old_system_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = self.make_tinfo_prefix(pathlib.Path(directory))
+            environments = []
+
+            def output(command, env=None):
+                environments.append(env)
+                values = {"--variable=pcfiledir": str(prefix / "lib" / "pkgconfig"), "--cflags": "-I" + str(prefix / "include"), "--libs": "-L{} -ltinfo".format(prefix / "lib")}
+                return 0, values[command[1]], ""
+
+            base = dict(os.environ, PKG_CONFIG_PATH="/old/system/pkgconfig")
+            with mock.patch("experiment.shutil.which", return_value="/usr/bin/pkg-config"), mock.patch("experiment.command_output", side_effect=output):
+                metadata = tinfo_pkg_config(prefix, base)
+            self.assertEqual(metadata["errors"], [])
+            self.assertTrue(all(env["PKG_CONFIG_LIBDIR"].startswith(str(prefix)) for env in environments))
+            self.assertTrue(all("/old/system/pkgconfig" not in env["PKG_CONFIG_LIBDIR"] for env in environments))
+
+    def test_tinfo_recipe_change_changes_cache_and_build_directory(self):
+        manifest = {"packages": {"tinfo": {"sha256": "archive"}}}
+        report = {"system-libs": {"stdout": "-ltinfo", "stderr": "", "returncode": 0}}
+        toolchain = {"CC": {"path": "/clang"}}
+        first = native_dependency_fingerprint(["tinfo"], manifest, report, toolchain, {"tinfo": {"revision": 1, "configure": ["--enable-widec"]}})
+        second = native_dependency_fingerprint(["tinfo"], manifest, report, toolchain, {"tinfo": TINFO_BUILD_RECIPE})
+        self.assertNotEqual(first, second)
+        self.assertIn("--disable-widec", TINFO_BUILD_RECIPE["configure"])
+        self.assertIn("--with-termlib=tinfo", TINFO_BUILD_RECIPE["configure"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            source.mkdir()
+            old_build = root / "build" / "ncurses-old-recipe"
+            old_build.mkdir(parents=True)
+            recorder = RecordingRunner()
+            with mock.patch("experiment.extract_vendor_source", return_value=source):
+                build_vendor_dependency(recorder, "tinfo", {"version": "6.5"}, root, root / "prefix", {"CC": "/clang", "CXX": "/clang++"})
+            configure, configure_cwd = recorder.commands[0]
+            self.assertNotEqual(configure_cwd, source)
+            self.assertNotEqual(configure_cwd, old_build)
+            self.assertIn("--disable-widec", configure)
+            self.assertIn("--with-termlib=tinfo", configure)
 
     def test_vendor_archives_have_expected_hashes(self):
         manifest = vendor_manifest()
