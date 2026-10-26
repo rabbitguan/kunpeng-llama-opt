@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from experiment import Recorder, build_tvm_with_existing_llvm, find_llvm_root, git_has_commit, missing_preinstall_commands, prepare_llvm, prepare_submodules, run_git_network, source_environment, validate_llvm_root
+from experiment import Recorder, build_tvm_with_existing_llvm, find_llvm_root, git_has_commit, missing_preinstall_commands, prepare_llvm, prepare_submodules, probe_dependency, run_git_network, setup, source_environment, tvm_build_fingerprint, tvm_config_text, validate_llvm_root, vendor_manifest
 
 
 class RecordingRunner:
@@ -126,20 +126,85 @@ class SetupTest(unittest.TestCase):
     def test_tvm_build_reuses_llvm_and_existing_build_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / "source"
-            template = source / "3rdparty" / "tvm" / "cmake" / "config.cmake"
-            template.parent.mkdir(parents=True)
-            template.write_text("set(USE_CUDA OFF)\n", encoding="ascii")
-            build = source / "3rdparty" / "tvm" / "build"
-            build.mkdir()
+            (source / "3rdparty" / "tvm").mkdir(parents=True)
+            build = source.parent / "build" / "tvm" / "test-key"
+            build.mkdir(parents=True)
             marker = build / "resume-marker"
             marker.write_text("keep\n", encoding="ascii")
             llvm_root = source / "build" / "clang+llvm-17.0.6-aarch64-linux-gnu"
+            deps_prefix = source.parent / "deps" / "test" / "prefix"
             recorder = RecordingRunner()
-            build_tvm_with_existing_llvm(recorder, source, llvm_root)
+            built, _ = build_tvm_with_existing_llvm(recorder, source, llvm_root, deps_prefix, {"final": {}}, "test-key")
+            self.assertEqual(built, build)
             self.assertTrue(marker.is_file())
-            self.assertEqual(recorder.commands[0][0], ["cmake", "-S", str(source / "3rdparty" / "tvm"), "-B", str(build), "-DUSE_LLVM={}".format(llvm_root / "bin" / "llvm-config")])
+            self.assertEqual(recorder.commands[0][0][:5], ["cmake", "-S", str(source / "3rdparty" / "tvm"), "-B", str(build)])
             self.assertEqual(recorder.commands[1][0], ["cmake", "--build", str(build), "-j", "4"])
             self.assertIn(str(llvm_root / "bin" / "llvm-config"), (build / "config.cmake").read_text(encoding="utf-8"))
+
+    def test_skipped_libbacktrace_is_disabled_in_tvm_config(self):
+        content = tvm_config_text(pathlib.Path("/llvm/bin/llvm-config"))
+        self.assertIn("set(USE_LIBBACKTRACE OFF)", content)
+        self.assertIn("set(BACKTRACE_ON_SEGFAULT OFF)", content)
+        self.assertIn("set(USE_CUDA OFF)", content)
+        self.assertIn("set(USE_FLASHINFER OFF)", content)
+
+    def test_dependency_fingerprint_changes_with_toolchain_or_dependencies(self):
+        report = {"system-libs": {"stdout": "-lz", "stderr": "", "returncode": 0}}
+        first = tvm_build_fingerprint("setup-a", "deps-a", report, pathlib.Path("/llvm-a"))
+        self.assertNotEqual(first, tvm_build_fingerprint("setup-a", "deps-b", report, pathlib.Path("/llvm-a")))
+        self.assertNotEqual(first, tvm_build_fingerprint("setup-a", "deps-a", report, pathlib.Path("/llvm-b")))
+
+    def test_pkg_config_success_does_not_hide_missing_zlib_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            compiler = root / "cc"
+            compiler.write_text("#!/bin/sh\nprintf '%s\\n' 'fatal error: zlib.h: No such file or directory' >&2\nexit 1\n", encoding="ascii")
+            compiler.chmod(compiler.stat().st_mode | stat.S_IXUSR)
+            recorder = Recorder(root)
+            with mock.patch("experiment.pkg_config_flags", return_value=["-I/fake/pkgconfig/include"]):
+                result = probe_dependency(recorder, "zlib", compiler, os.environ.copy(), root)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["stage"], "compile_link")
+            self.assertIn("zlib.h", result["compile_output"])
+
+    def test_zlib_headers_do_not_hide_link_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            include = root / "include"
+            include.mkdir()
+            (include / "zlib.h").write_text("/* test */\n", encoding="ascii")
+            (include / "zconf.h").write_text("/* test */\n", encoding="ascii")
+            compiler = root / "cc"
+            compiler.write_text("#!/bin/sh\nprintf '%s\\n' 'ld: cannot find -lz' >&2\nexit 1\n", encoding="ascii")
+            compiler.chmod(compiler.stat().st_mode | stat.S_IXUSR)
+            recorder = Recorder(root)
+            with mock.patch("experiment.pkg_config_flags", side_effect=lambda package, env, option="--cflags": ["-I" + str(include)] if option == "--cflags" else ["-lz"]):
+                result = probe_dependency(recorder, "zlib", compiler, os.environ.copy(), root)
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("cannot find -lz", result["compile_output"])
+
+    def test_vendor_archives_have_expected_hashes(self):
+        manifest = vendor_manifest()
+        self.assertEqual(set(manifest["packages"]), {"zlib", "zstd", "xml2", "tinfo"})
+
+    def test_setup_does_not_call_official_build_hook(self):
+        import inspect
+        text = inspect.getsource(setup)
+        self.assertNotIn("setup.py", text)
+        self.assertNotIn('MANUAL_BUILD": "0"', text)
+
+    def test_setup_failure_removes_success_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "tmac"
+            (root / "source").mkdir(parents=True)
+            marker = root / ".setup-fingerprint"
+            marker.write_text("old-success\n", encoding="ascii")
+            config = {"paths": {"tmac_root": str(root)}, "source": {"commit": "0" * 40, "url": "unused"}}
+            recorder = Recorder(root)
+            with mock.patch("experiment.git_has_commit", side_effect=RuntimeError("source check failed")):
+                with self.assertRaisesRegex(RuntimeError, "source check failed"):
+                    setup(config, recorder)
+            self.assertFalse(marker.exists())
 
     def test_preinstall_check_does_not_require_clang(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +268,35 @@ class SetupTest(unittest.TestCase):
                 recorder.run([sys.executable, "-c", "import time; print('before-timeout', flush=True); time.sleep(5)"], timeout=0.1, capture=True)
             log = (pathlib.Path(directory) / "console.log").read_text(encoding="utf-8")
             self.assertIn("before-timeout", log)
+
+    @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
+    def test_recorder_timeout_terminates_child_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            marker = root / "child-terminated"
+            child = "import pathlib,signal,sys,time; p=pathlib.Path(sys.argv[1]); signal.signal(signal.SIGTERM, lambda *_: (p.write_text('terminated'), sys.exit(0))); time.sleep(30)"
+            parent = "import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); time.sleep(30)"
+            recorder = Recorder(root)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                recorder.run([sys.executable, "-c", parent, child, str(marker)], timeout=0.5, capture=True, heartbeat=0.1)
+            for _ in range(20):
+                if marker.exists():
+                    break
+                __import__("time").sleep(0.05)
+            self.assertEqual(marker.read_text(), "terminated")
+
+    def test_recorder_interrupt_uses_process_group_termination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.MagicMock()
+            process.pid = 123
+            process.stdout = []
+            process.poll.return_value = None
+            process.wait.side_effect = KeyboardInterrupt()
+            recorder = Recorder(pathlib.Path(directory))
+            with mock.patch("experiment.subprocess.Popen", return_value=process), mock.patch.object(recorder, "terminate") as terminate:
+                with self.assertRaises(KeyboardInterrupt):
+                    recorder.run(["fake-command"])
+            terminate.assert_called_once_with(process)
 
     def test_only_required_submodules_are_prepared_without_recursion(self):
         config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"

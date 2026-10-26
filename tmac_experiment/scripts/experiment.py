@@ -10,12 +10,14 @@ import pathlib
 import platform
 import posixpath
 import re
+import signal
 import shlex
 import shutil
 import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import traceback
@@ -31,6 +33,14 @@ LLVM_ARCHIVE_NAMES = {
     ("Linux", "aarch64"): "clang+llvm-17.0.6-aarch64-linux-gnu.tar.xz",
     ("Linux", "x86_64"): "clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz",
     ("Darwin", "arm64"): "clang+llvm-17.0.6-arm64-apple-darwin22.0.tar.xz",
+}
+VENDOR_DIR = EXPERIMENT_DIR / "vendor"
+LLVM_CONFIG_QUERIES = ["--cxxflags", "--ldflags", "--libfiles", "--system-libs", "--targets-built"]
+DEPENDENCY_SPECS = {
+    "zlib": {"flag": "-lz", "source": "#include <zlib.h>\n#include <zconf.h>\nint main() { return zlibVersion() ? 0 : 1; }\n", "pkg": "zlib"},
+    "zstd": {"flag": "-lzstd", "source": "#include <zstd.h>\nint main() { return ZSTD_versionNumber() > 0 ? 0 : 1; }\n", "pkg": "libzstd"},
+    "xml2": {"flag": "-lxml2", "source": "#include <libxml/parser.h>\nint main() { xmlDocPtr d = xmlReadMemory(\"<a/>\", 4, 0, 0, 0); if (!d) return 1; xmlFreeDoc(d); return 0; }\n", "pkg": "libxml-2.0"},
+    "tinfo": {"flag": "-ltinfo", "source": "#include <curses.h>\n#include <term.h>\nint main() { int error = 0; (void)setupterm(0, 1, &error); return 0; }\n", "pkg": "tinfo"},
 }
 
 
@@ -69,6 +79,8 @@ def fingerprint(config, source):
         "config": config,
         "source": source,
         "patches": {path.name: sha256_file(path) for path in sorted((EXPERIMENT_DIR / "patches").glob("*.patch"))},
+        "scripts": {path.name: sha256_file(path) for path in sorted(SCRIPT_DIR.glob("*.py"))},
+        "vendor": {path.name: sha256_file(path) for path in sorted(VENDOR_DIR.glob("*")) if path.is_file()},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -85,14 +97,30 @@ class Recorder:
         with open(self.log_path, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
-    def run(self, command, cwd=None, env=None, timeout=None, check=True, capture=False):
+    def terminate(self, process):
+        if process.poll() is not None:
+            return
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait()
+
+    def run(self, command, cwd=None, env=None, timeout=None, check=True, capture=False, heartbeat=60):
         rendered = shlex.join([str(value) for value in command])
         self.log("RUN cwd={} command={}".format(cwd or os.getcwd(), rendered))
         started = time.monotonic()
         merged_env = os.environ.copy()
         if env:
             merged_env.update({str(k): str(v) for k, v in env.items()})
-        process = subprocess.Popen(command, cwd=cwd, env=merged_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+        process = subprocess.Popen(command, cwd=cwd, env=merged_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, start_new_session=(os.name == "posix"))
         output_parts = []
         timed_out = False
         with open(self.log_path, "a", encoding="utf-8") as handle:
@@ -105,18 +133,36 @@ class Recorder:
                         print(line, end="", flush=True)
             reader = threading.Thread(target=consume_output)
             reader.start()
+            deadline = started + timeout if timeout is not None else None
             try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                process.kill()
-                process.wait()
-            reader.join()
+                while process.poll() is None:
+                    interval = heartbeat
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            self.terminate(process)
+                            break
+                        interval = min(interval, remaining)
+                    try:
+                        process.wait(timeout=interval)
+                    except subprocess.TimeoutExpired:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            timed_out = True
+                            self.terminate(process)
+                            break
+                        self.log("still running after {:.0f} seconds: {}".format(time.monotonic() - started, rendered))
+            except (KeyboardInterrupt, SystemExit):
+                self.terminate(process)
+                raise
+            finally:
+                reader.join()
         process.stdout.close()
         returncode = process.returncode
         elapsed = time.monotonic() - started
         output = "".join(output_parts)
         self.commands.append({"command": rendered, "cwd": str(cwd or os.getcwd()), "seconds": elapsed, "exit_code": returncode})
+        self.log("DONE exit_code={} elapsed={:.1f}s command={}".format(returncode, elapsed, rendered))
         if timed_out:
             raise subprocess.TimeoutExpired(command, timeout, output=output)
         completed = subprocess.CompletedProcess(command, returncode, output, None)
@@ -388,69 +434,367 @@ def prepare_llvm(recorder, source):
     return None, diagnostics
 
 
+def llvm_config_report(recorder, llvm_root, tvm=None):
+    llvm_config = llvm_root / "bin" / "llvm-config"
+    report = {}
+    errors = []
+    for option in LLVM_CONFIG_QUERIES:
+        try:
+            returncode, stdout, stderr = command_output([str(llvm_config), option])
+        except OSError as error:
+            errors.append("llvm-config {} could not run: {}".format(option, error))
+            continue
+        report[option[2:]] = {"stdout": stdout, "stderr": stderr, "returncode": returncode}
+        if stderr:
+            recorder.log("llvm-config {} stderr: {}".format(option, stderr))
+        if returncode:
+            errors.append("llvm-config {} failed with exit code {}: {}".format(option, returncode, stderr or stdout))
+    libfiles = shlex.split(report.get("libfiles", {}).get("stdout", ""))
+    missing_libraries = [path for path in libfiles if not pathlib.Path(path).is_file()]
+    if missing_libraries:
+        errors.append("LLVM library files are missing: {}".format(", ".join(missing_libraries)))
+    targets = shlex.split(report.get("targets-built", {}).get("stdout", ""))
+    if "AArch64" not in targets:
+        errors.append("LLVM targets-built does not include AArch64: {}".format(" ".join(targets)))
+    if tvm is not None:
+        find_llvm = pathlib.Path(tvm) / "cmake" / "utils" / "FindLLVM.cmake"
+        required_queries = ["--libfiles", "--system-libs", "--cxxflags", "--targets-built"]
+        content = find_llvm.read_text(encoding="utf-8", errors="replace") if find_llvm.is_file() else ""
+        missing_queries = [query for query in required_queries if query not in content]
+        if missing_queries:
+            errors.append("fixed TVM FindLLVM.cmake is missing expected llvm-config queries: {}".format(", ".join(missing_queries)))
+        report["findllvm"] = {"path": str(find_llvm), "sha256": sha256_file(find_llvm) if find_llvm.is_file() else None, "required_queries": required_queries}
+    if errors:
+        raise RuntimeError("LLVM configuration checks failed:\n- " + "\n- ".join(errors))
+    return report
+
+
+def dependency_environment(prefix, base_env=None):
+    base_env = os.environ if base_env is None else base_env
+    lib_dirs = [prefix / "lib", prefix / "lib64"]
+    values = {
+        "CMAKE_PREFIX_PATH": prepend_path(prefix, base_env.get("CMAKE_PREFIX_PATH", "")),
+        "CPATH": prepend_path(prefix / "include", base_env.get("CPATH", "")),
+        "LIBRARY_PATH": os.pathsep.join([str(path) for path in lib_dirs] + ([base_env["LIBRARY_PATH"]] if base_env.get("LIBRARY_PATH") else [])),
+        "LD_LIBRARY_PATH": os.pathsep.join([str(path) for path in lib_dirs] + ([base_env["LD_LIBRARY_PATH"]] if base_env.get("LD_LIBRARY_PATH") else [])),
+        "PKG_CONFIG_PATH": os.pathsep.join([str(prefix / "lib" / "pkgconfig"), str(prefix / "lib64" / "pkgconfig"), str(prefix / "share" / "pkgconfig")] + ([base_env["PKG_CONFIG_PATH"]] if base_env.get("PKG_CONFIG_PATH") else [])),
+    }
+    return values
+
+
+def pkg_config_flags(package, env, option="--cflags"):
+    if not shutil.which("pkg-config", path=env.get("PATH")):
+        return []
+    completed = subprocess.run(["pkg-config", option, package], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return shlex.split(completed.stdout) if completed.returncode == 0 else []
+
+
+def probe_dependency(recorder, name, compiler, env, work):
+    spec = DEPENDENCY_SPECS[name]
+    source_file = work / "probe-{}.c".format(name)
+    binary = work / "probe-{}".format(name)
+    source_file.write_text(spec["source"], encoding="ascii")
+    cflags = pkg_config_flags(spec["pkg"], env)
+    ldflags = pkg_config_flags(spec["pkg"], env, "--libs")
+    command = [str(compiler)] + cflags + [str(source_file)] + ldflags + ([] if spec["flag"] in ldflags else [spec["flag"]]) + ["-o", str(binary)]
+    compiled = recorder.run(command, env=env, check=False, capture=True)
+    result = {"compile_command": shlex.join(command), "compile_returncode": compiled.returncode, "compile_output": compiled.stdout, "cflags": cflags, "ldflags": ldflags}
+    if compiled.returncode:
+        result.update({"status": "failed", "stage": "compile_link"})
+        return result
+    executed = recorder.run([str(binary)], env=env, check=False, capture=True)
+    result.update({"run_returncode": executed.returncode, "run_output": executed.stdout, "status": "pass" if executed.returncode == 0 else "failed", "stage": "run"})
+    return result
+
+
+def vendor_manifest():
+    path = VENDOR_DIR / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    errors = []
+    for name, package in manifest["packages"].items():
+        archive = VENDOR_DIR / package["archive"]
+        if not archive.is_file():
+            errors.append("{} archive is missing: {}".format(name, archive))
+        elif sha256_file(archive) != package["sha256"]:
+            errors.append("{} archive SHA256 mismatch: {}".format(name, archive))
+        else:
+            try:
+                with tarfile.open(archive, "r:*") as handle:
+                    if package["license_file"] not in handle.getnames():
+                        errors.append("{} archive does not contain declared license {}".format(name, package["license_file"]))
+            except (OSError, tarfile.TarError) as error:
+                errors.append("{} archive is unreadable: {}".format(name, error))
+    if errors:
+        raise RuntimeError("vendored dependency validation failed:\n- " + "\n- ".join(errors))
+    return manifest
+
+
+def extract_vendor_source(package, destination):
+    marker = destination / ".extracted"
+    if marker.is_file() and marker.read_text(encoding="ascii").strip() == package["sha256"]:
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    archive = VENDOR_DIR / package["archive"]
+    with tarfile.open(archive, "r:*") as handle:
+        members = handle.getmembers()
+        roots = {pathlib.PurePosixPath(member.name).parts[0] for member in members if pathlib.PurePosixPath(member.name).parts}
+        unsafe = len(roots) != 1 or any(pathlib.PurePosixPath(member.name).is_absolute() or ".." in pathlib.PurePosixPath(member.name).parts for member in members)
+        archive_root = next(iter(roots)) if len(roots) == 1 else ""
+        for member in members:
+            if member.issym() or member.islnk():
+                path = pathlib.PurePosixPath(member.name)
+                target = pathlib.PurePosixPath(member.linkname)
+                base = path.parent if member.issym() else pathlib.PurePosixPath()
+                resolved_target = pathlib.PurePosixPath(posixpath.normpath(str(base / target)))
+                unsafe = unsafe or target.is_absolute() or not resolved_target.parts or resolved_target.parts[0] != archive_root
+        if unsafe:
+            raise RuntimeError("unsafe vendor archive layout: {}".format(archive))
+        extract_root = destination.parent
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            handle.extractall(extract_root)
+        extracted = extract_root / archive_root
+    if extracted != destination and not destination.exists():
+        extracted.rename(destination)
+    marker.write_text(package["sha256"] + "\n", encoding="ascii")
+    return destination
+
+
+def build_vendor_dependency(recorder, name, package, deps_root, prefix, compiler_env):
+    source = extract_vendor_source(package, deps_root / "src" / "{}-{}".format(name, package["version"]))
+    env = os.environ.copy()
+    env.update(compiler_env)
+    env.update(dependency_environment(prefix, env))
+    env.update({"CC": compiler_env["CC"], "CXX": compiler_env["CXX"], "CFLAGS": "-O2 -fPIC", "CXXFLAGS": "-O2 -fPIC"})
+    recorder.log("building project-local dependency {} {}".format(name, package["version"]))
+    if name == "zlib":
+        recorder.run(["./configure", "--prefix={}".format(prefix)], cwd=source, env=env)
+        recorder.run(["make", "-j4"], cwd=source, env=env)
+        recorder.run(["make", "install"], cwd=source, env=env)
+    elif name == "zstd":
+        recorder.run(["make", "-C", "lib", "-j4", "BUILD_SHARED=1", "PIC=1"], cwd=source, env=env)
+        recorder.run(["make", "-C", "lib", "install", "BUILD_SHARED=1", "PIC=1", "PREFIX={}".format(prefix)], cwd=source, env=env)
+    elif name == "xml2":
+        recorder.run(["./configure", "--prefix={}".format(prefix), "--without-python", "--without-lzma", "--without-iconv", "--with-zlib"], cwd=source, env=env)
+        recorder.run(["make", "-j4"], cwd=source, env=env)
+        recorder.run(["make", "install"], cwd=source, env=env)
+    elif name == "tinfo":
+        recorder.run(["./configure", "--prefix={}".format(prefix), "--with-shared", "--with-termlib", "--with-pic", "--without-debug", "--without-ada", "--without-cxx-binding", "--enable-pc-files", "--with-pkg-config-libdir={}".format(prefix / "lib" / "pkgconfig")], cwd=source, env=env)
+        recorder.run(["make", "-j4"], cwd=source, env=env)
+        recorder.run(["make", "install"], cwd=source, env=env)
+    else:
+        raise RuntimeError("no vendor build recipe for {}".format(name))
+
+
+def required_llvm_dependencies(report):
+    flags = shlex.split(report["system-libs"]["stdout"])
+    return [name for name, spec in DEPENDENCY_SPECS.items() if spec["flag"] in flags]
+
+
+def prepare_native_dependencies(recorder, root, llvm_root, report):
+    manifest = vendor_manifest()
+    compiler_env = {"CC": str(llvm_root / "bin" / "clang"), "CXX": str(llvm_root / "bin" / "clang++")}
+    required = required_llvm_dependencies(report)
+    toolchain = {}
+    for name, path in compiler_env.items():
+        tool = pathlib.Path(path)
+        stat_result = tool.stat()
+        returncode, stdout, stderr = command_output([str(tool), "--version"])
+        toolchain[name] = {"path": str(tool.resolve()), "size": stat_result.st_size, "mtime_ns": stat_result.st_mtime_ns, "returncode": returncode, "stdout": stdout, "stderr": stderr}
+    payload = {"required": required, "manifest": {name: manifest["packages"][name]["sha256"] for name in required}, "llvm": report, "toolchain": toolchain}
+    dep_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+    deps_root = root / "deps" / dep_key
+    prefix = deps_root / "prefix"
+    work = deps_root / "checks"
+    work.mkdir(parents=True, exist_ok=True)
+    system_env = os.environ.copy()
+    system_probe = {name: probe_dependency(recorder, name, compiler_env["CC"], system_env, work) for name in required}
+    existing_env = os.environ.copy()
+    existing_env.update(dependency_environment(prefix, existing_env))
+    existing_probe = {name: probe_dependency(recorder, name, compiler_env["CC"], existing_env, work) for name in required}
+    missing = [name for name in required if existing_probe[name]["status"] != "pass"]
+    if missing:
+        recorder.log("native dependencies requiring project-local recovery: {}".format(", ".join(missing)))
+    initial_diagnostic = {"fingerprint": dep_key, "required": required, "system": system_probe, "existing_project": existing_probe, "prefix": str(prefix), "llvm_config": report, "toolchain": toolchain}
+    (deps_root / "diagnostics.json").write_text(json.dumps(initial_diagnostic, indent=2) + "\n", encoding="utf-8")
+    build_errors = []
+    for name in missing:
+        try:
+            build_vendor_dependency(recorder, name, manifest["packages"][name], deps_root, prefix, compiler_env)
+        except Exception as error:
+            build_errors.append("{}: {}: {}".format(name, type(error).__name__, error))
+    final_env = os.environ.copy()
+    final_env.update(dependency_environment(prefix, final_env))
+    final = {name: probe_dependency(recorder, name, compiler_env["CC"], final_env, work) for name in required}
+    failures = build_errors + ["{}: {}: {}".format(name, final[name]["stage"], final[name].get("compile_output") or final[name].get("run_output")) for name in required if final[name]["status"] != "pass"]
+    diagnostic = {"fingerprint": dep_key, "required": required, "system": system_probe, "existing_project": existing_probe, "final": final, "prefix": str(prefix), "llvm_config": report, "toolchain": toolchain}
+    (deps_root / "diagnostics.json").write_text(json.dumps(diagnostic, indent=2) + "\n", encoding="utf-8")
+    if failures:
+        raise RuntimeError("native dependency checks failed after local recovery:\n- " + "\n- ".join(failures))
+    return prefix, dep_key, diagnostic
+
+
+def tvm_build_fingerprint(setup_fingerprint, dep_key, report, llvm_root):
+    payload = {"setup": setup_fingerprint, "dependencies": dep_key, "llvm": report, "tvm_config": tvm_config_text(llvm_root / "bin" / "llvm-config"), "cc": str(llvm_root / "bin" / "clang"), "cxx": str(llvm_root / "bin" / "clang++")}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def validate_setup_state(config, commits, source):
+    root = source.parent
+    stamp = root / ".setup-fingerprint"
+    state_path = root / "setup-environment.json"
+    if not stamp.is_file() or not state_path.is_file():
+        raise RuntimeError("setup has not completed successfully; run bash tmac_experiment/run.sh setup")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if stamp.read_text(encoding="ascii").strip() != state.get("fingerprint"):
+        raise RuntimeError("setup success marker does not match setup-environment.json")
+    current = fingerprint(config, commits)
+    if state.get("setup_fingerprint") != current:
+        raise RuntimeError("setup inputs changed; rerun bash tmac_experiment/run.sh setup")
+    for identity in state.get("dependency_diagnostic", {}).get("toolchain", {}).values():
+        path = pathlib.Path(identity["path"])
+        if not path.is_file():
+            raise RuntimeError("validated setup tool is missing: {}".format(path))
+        stat_result = path.stat()
+        if stat_result.st_size != identity["size"] or stat_result.st_mtime_ns != identity["mtime_ns"]:
+            raise RuntimeError("validated setup tool changed: {}; rerun setup".format(path))
+    if not has_tvm_compiler_library(source, pathlib.Path(state["tvm_build"])):
+        raise RuntimeError("validated TVM library is missing; rerun setup")
+    return state
+
+
+def validate_llvm_api(recorder, root, llvm_root, report, runtime_env):
+    smoke = root / "checks" / "llvm-api"
+    smoke.mkdir(parents=True, exist_ok=True)
+    source = smoke / "main.cpp"
+    binary = smoke / "llvm-api-smoke"
+    source.write_text("#include <llvm/MC/TargetRegistry.h>\n#include <llvm/Support/TargetSelect.h>\n#include <string>\nint main() { llvm::InitializeAllTargetInfos(); llvm::InitializeAllTargets(); llvm::InitializeAllTargetMCs(); std::string e; return llvm::TargetRegistry::lookupTarget(\"aarch64\", e) ? 0 : 1; }\n", encoding="ascii")
+    command = [str(llvm_root / "bin" / "clang++")] + shlex.split(report["cxxflags"]["stdout"]) + [str(source), "-o", str(binary)] + shlex.split(report["ldflags"]["stdout"]) + shlex.split(report["libfiles"]["stdout"]) + shlex.split(report["system-libs"]["stdout"])
+    recorder.run(command, env=runtime_env)
+    recorder.run([str(binary)], env=runtime_env)
+    return {"source": str(source), "binary": str(binary), "command": shlex.join(command)}
+
+
 def tvm_library_paths(source):
     build = source / "3rdparty" / "tvm" / "build"
     patterns = ["libtvm.so", "libtvm.dylib", "tvm.dll", "libtvm_runtime.so", "libtvm_runtime.dylib", "tvm_runtime.dll"]
     return [build / name for name in patterns if (build / name).is_file()]
 
 
-def has_tvm_compiler_library(source):
+def has_tvm_compiler_library(source, tvm_build=None):
+    if tvm_build is not None:
+        build = pathlib.Path(tvm_build)
+        patterns = ["libtvm.so", "libtvm.dylib", "tvm.dll"]
+        paths = [build / name for name in patterns if (build / name).is_file()]
+    else:
+        paths = tvm_library_paths(source)
     required = "libtvm.so" if platform.system() == "Linux" else "libtvm.dylib" if platform.system() == "Darwin" else "tvm.dll"
-    return any(path.name == required for path in tvm_library_paths(source))
+    return any(path.name == required for path in paths)
 
 
-def source_environment(source, llvm_root=None, base_env=None):
+def source_environment(source, llvm_root=None, base_env=None, deps_prefix=None, tvm_build=None):
     base_env = os.environ if base_env is None else base_env
+    state_path = source.parent / "setup-environment.json"
+    if state_path.is_file() and (deps_prefix is None or tvm_build is None):
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        deps_prefix = pathlib.Path(state["deps_prefix"]) if deps_prefix is None else deps_prefix
+        tvm_build = pathlib.Path(state["tvm_build"]) if tvm_build is None else tvm_build
     if llvm_root is None:
         llvm_root, diagnostics = find_llvm_root(source)
         if llvm_root is None:
             raise RuntimeError("compatible LLVM 17.0.6 was not found: {}".format("; ".join(diagnostics) or "no candidates"))
     tvm = source / "3rdparty" / "tvm"
+    tvm_build = tvm / "build" if tvm_build is None else pathlib.Path(tvm_build)
+    merged = base_env.copy()
+    if deps_prefix is not None:
+        merged.update(dependency_environment(pathlib.Path(deps_prefix), merged))
     values = {
         "TVM_ROOT": str(tvm),
-        "PATH": prepend_path(llvm_root / "bin", base_env.get("PATH", "")),
-        "PYTHONPATH": prepend_path(tvm / "python", base_env.get("PYTHONPATH", "")),
+        "PATH": prepend_path(llvm_root / "bin", merged.get("PATH", "")),
+        "PYTHONPATH": prepend_path(tvm / "python", merged.get("PYTHONPATH", "")),
         "TMAC_LLVM_ROOT": str(llvm_root),
+        "TVM_LIBRARY_PATH": str(tvm_build),
     }
-    library_parts = [str(llvm_root / "lib"), str(tvm / "build")]
-    if base_env.get("LD_LIBRARY_PATH"):
-        library_parts.append(base_env["LD_LIBRARY_PATH"])
+    values.update({name: value for name, value in merged.items() if name in ["CMAKE_PREFIX_PATH", "CPATH", "LIBRARY_PATH", "PKG_CONFIG_PATH"]})
+    library_parts = [str(llvm_root / "lib"), str(tvm_build)]
+    if merged.get("LD_LIBRARY_PATH"):
+        library_parts.append(merged["LD_LIBRARY_PATH"])
     values["LD_LIBRARY_PATH"] = os.pathsep.join(library_parts)
     if platform.system() == "Darwin":
-        dyld_parts = [str(llvm_root / "lib"), str(tvm / "build")]
-        if base_env.get("DYLD_LIBRARY_PATH"):
-            dyld_parts.append(base_env["DYLD_LIBRARY_PATH"])
+        dyld_parts = [str(llvm_root / "lib"), str(tvm_build)]
+        if merged.get("DYLD_LIBRARY_PATH"):
+            dyld_parts.append(merged["DYLD_LIBRARY_PATH"])
         values["DYLD_LIBRARY_PATH"] = os.pathsep.join(dyld_parts)
     return values
 
 
-def validate_tvm_build(recorder, source, python, runtime_env):
-    if not has_tvm_compiler_library(source):
-        raise RuntimeError("TVM build library is missing under {}".format(source / "3rdparty" / "tvm" / "build"))
-    config = source / "3rdparty" / "tvm" / "build" / "config.cmake"
+def validate_tvm_build(recorder, source, python, runtime_env, tvm_build):
+    if not has_tvm_compiler_library(source, tvm_build):
+        raise RuntimeError("TVM build library is missing under {}".format(tvm_build))
+    config = pathlib.Path(tvm_build) / "config.cmake"
     llvm_config = pathlib.Path(runtime_env["TMAC_LLVM_ROOT"]) / "bin" / "llvm-config"
     if not config.is_file() or str(llvm_config) not in config.read_text(encoding="utf-8", errors="replace"):
         raise RuntimeError("TVM config.cmake does not reference the validated llvm-config: {}".format(llvm_config))
     recorder.run([str(python), "-c", "import t_mac, tvm; print('t_mac=' + t_mac.__file__); print('tvm=' + tvm.__version__); print('tvm_python=' + tvm.__file__)"], cwd=source, env=runtime_env)
+    recorder.run([str(python), str(EXPERIMENT_DIR / "scripts" / "smoke_tvm.py")], cwd=source, env=runtime_env)
 
 
-def build_tvm_with_existing_llvm(recorder, source, llvm_root):
+def tvm_config_text(llvm_config):
+    settings = {
+        "USE_LLVM": str(llvm_config),
+        "USE_LIBBACKTRACE": "OFF",
+        "BACKTRACE_ON_SEGFAULT": "OFF",
+        "USE_CUDA": "OFF",
+        "USE_OPENCL": "OFF",
+        "USE_VULKAN": "OFF",
+        "USE_CUTLASS": "OFF",
+        "USE_FLASHINFER": "OFF",
+        "USE_VTA_FSIM": "OFF",
+        "USE_VTA_TSIM": "OFF",
+        "USE_VTA_FPGA": "OFF",
+    }
+    return "".join("set({} {})\n".format(name, value) for name, value in settings.items())
+
+
+def find_project_library(prefix, stem):
+    candidates = []
+    for directory in [prefix / "lib", prefix / "lib64"]:
+        candidates.extend(sorted(directory.glob("lib{}.so".format(stem))))
+        candidates.extend(sorted(directory.glob("lib{}.a".format(stem))))
+    return candidates[0] if candidates else None
+
+
+def zlib_cmake_args(deps_prefix, dependency_diagnostic):
+    project_library = find_project_library(deps_prefix, "z")
+    project_header = deps_prefix / "include" / "zlib.h"
+    if project_library and project_header.is_file():
+        return ["-DZLIB_ROOT={}".format(deps_prefix), "-DZLIB_INCLUDE_DIR={}".format(project_header.parent), "-DZLIB_LIBRARY={}".format(project_library)]
+    probe = dependency_diagnostic.get("final", {}).get("zlib", {})
+    include_dirs = [pathlib.Path(flag[2:]) for flag in probe.get("cflags", []) if flag.startswith("-I")]
+    library_dirs = [pathlib.Path(flag[2:]) for flag in probe.get("ldflags", []) if flag.startswith("-L")]
+    headers = [path / "zlib.h" for path in include_dirs if (path / "zlib.h").is_file() and (path / "zconf.h").is_file()]
+    libraries = []
+    for directory in library_dirs:
+        libraries.extend(path for pattern in ["libz.so", "libz.a", "libz.dylib"] for path in directory.glob(pattern))
+    if headers and libraries:
+        return ["-DZLIB_INCLUDE_DIR={}".format(headers[0].parent), "-DZLIB_LIBRARY={}".format(libraries[0])]
+    return []
+
+
+def build_tvm_with_existing_llvm(recorder, source, llvm_root, deps_prefix, dependency_diagnostic, build_key):
     tvm = source / "3rdparty" / "tvm"
-    build = tvm / "build"
+    build = source.parent / "build" / "tvm" / build_key
     build.mkdir(parents=True, exist_ok=True)
     config = build / "config.cmake"
-    if not config.exists():
-        shutil.copy2(tvm / "cmake" / "config.cmake", config)
     llvm_config = llvm_root / "bin" / "llvm-config"
-    setting = "set(USE_LLVM {})".format(llvm_config)
-    content = config.read_text(encoding="utf-8")
-    if setting not in content:
-        with open(config, "a", encoding="utf-8") as handle:
-            handle.write("\n" + setting + "\n")
-    runtime_env = source_environment(source, llvm_root)
+    config.write_text(tvm_config_text(llvm_config), encoding="ascii")
+    runtime_env = source_environment(source, llvm_root, deps_prefix=deps_prefix, tvm_build=build)
+    command = ["cmake", "-S", str(tvm), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER={}".format(llvm_root / "bin" / "clang"), "-DCMAKE_CXX_COMPILER={}".format(llvm_root / "bin" / "clang++"), "-DCMAKE_PREFIX_PATH={}".format(deps_prefix), "-DUSE_LLVM={}".format(llvm_config), "-DUSE_LIBBACKTRACE=OFF", "-DBACKTRACE_ON_SEGFAULT=OFF", "-DUSE_CUDA=OFF", "-DUSE_OPENCL=OFF", "-DUSE_VULKAN=OFF", "-DUSE_CUTLASS=OFF", "-DUSE_FLASHINFER=OFF", "-DUSE_VTA_FSIM=OFF", "-DUSE_VTA_TSIM=OFF", "-DUSE_VTA_FPGA=OFF"]
+    command.extend(zlib_cmake_args(deps_prefix, dependency_diagnostic))
     recorder.log("building pinned TVM with the already validated LLVM 17.0.6 toolchain")
-    recorder.run(["cmake", "-S", str(tvm), "-B", str(build), "-DUSE_LLVM={}".format(llvm_config)], cwd=source, env=runtime_env)
+    recorder.run(command, cwd=source, env=runtime_env)
     recorder.run(["cmake", "--build", str(build), "-j", "4"], cwd=source, env=runtime_env)
+    return build, runtime_env
 
 
 def missing_preinstall_commands(path=None):
@@ -461,6 +805,13 @@ def setup(config, recorder):
     root = pathlib.Path(config["paths"]["tmac_root"])
     source = root / "source"
     root.mkdir(parents=True, exist_ok=True)
+    stamp = root / ".setup-fingerprint"
+    state_path = root / "setup-environment.json"
+    if stamp.exists():
+        stamp.unlink()
+    if state_path.exists():
+        state_path.unlink()
+    recorder.log("setup stage: source verification; log={}".format(recorder.log_path))
     if not source.exists():
         run_git_network(recorder, ["git", "-c", "http.version=HTTP/1.1", "clone", "--no-checkout", config["source"]["url"], str(source)], root)
     target_commit = config["source"]["commit"]
@@ -477,72 +828,54 @@ def setup(config, recorder):
     apply_patch(recorder, source)
 
     missing = missing_preinstall_commands()
-    if shutil.which("pkg-config"):
-        for package in ["zlib", "libzstd", "libxml-2.0"]:
-            if subprocess.run(["pkg-config", "--exists", package]).returncode:
-                missing.append("pkg-config package " + package)
-    else:
-        missing.append("pkg-config (used to check zlib, libzstd, and libxml2)")
     if sys.version_info < (3, 8) or sys.version_info >= (3, 12):
         missing.append("Python 3.8-3.11 (fixed TVM does not support Python 3.12)")
     if missing:
         raise RuntimeError("missing prerequisites: {}. Install them in a user directory and override PATH; do not replace system libraries".format(", ".join(missing)))
 
+    recorder.log("setup stage: LLVM validation and link metadata")
+    llvm_root, llvm_detail = prepare_llvm(recorder, source)
+    if llvm_root is None:
+        raise RuntimeError("the pinned project-local LLVM 17.0.6 is required; setup will not invoke the official download hook: {}".format("; ".join(llvm_detail) or "no candidates"))
+    report = llvm_config_report(recorder, llvm_root, source / "3rdparty" / "tvm")
+    recorder.log("setup stage: native dependency compile/link/run probes")
+    deps_prefix, dep_key, dependency_diagnostic = prepare_native_dependencies(recorder, root, llvm_root, report)
+    setup_fingerprint = fingerprint(config, commits)
+    build_key = tvm_build_fingerprint(setup_fingerprint, dep_key, report, llvm_root)
+    tvm_build = root / "build" / "tvm" / build_key
+    runtime_env = source_environment(source, llvm_root, deps_prefix=deps_prefix, tvm_build=tvm_build)
+    recorder.log("setup stage: LLVM API compile/link/run smoke")
+    llvm_smoke = validate_llvm_api(recorder, root, llvm_root, report, runtime_env)
+
     venv = root / "venv"
-    venv_created = False
     if not (venv / "bin" / "python").exists():
         recorder.run([sys.executable, "-m", "venv", str(venv)])
-        venv_created = True
     python = venv / "bin" / "python"
-    install_env = {"MANUAL_BUILD": "0"}
-    stamp = root / ".setup-fingerprint"
-    current = fingerprint(config, commits)
-    llvm_root, llvm_detail = prepare_llvm(recorder, source)
-    editable_installed = subprocess.run([str(python), "-m", "pip", "show", "t-mac"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    prepared = not venv_created and editable_installed and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == current and llvm_root is not None and has_tvm_compiler_library(source)
-    if prepared:
-        recorder.log("setup fingerprint and build artifacts match; skipping dependency download and rebuild")
-    else:
-        if stamp.exists():
-            stamp.unlink()
-        if editable_installed:
-            recorder.log("reusing the installed T-MAC Python package and its dependencies")
-        else:
-            recorder.run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=source)
-            recorder.run([str(python), "-m", "pip", "install", "-r", "requirements-codegen.txt"], cwd=source)
-    if llvm_root is not None:
-        recorder.log("reusing validated LLVM toolchain {}: {}".format(llvm_root, llvm_detail))
-    else:
-        recorder.log("no validated LLVM 17.0.6 toolchain found before install: {}".format("; ".join(llvm_detail) or "no candidates"))
-    if not prepared and llvm_root is not None:
-        build_tvm_with_existing_llvm(recorder, source, llvm_root)
-    if not prepared and llvm_root is None:
-        recorder.log("running pinned T-MAC editable install with its official LLVM 17.0.6 and TVM build hook")
-        recorder.run([str(python), "-m", "pip", "install", "--no-deps", "--force-reinstall", "-e", ".", "-v"], cwd=source, env=install_env)
-        llvm_root, llvm_detail = find_llvm_root(source)
-        if llvm_root is None or not has_tvm_compiler_library(source):
-            recorder.log("editable install did not execute or complete the pinned build_py hook; invoking that official hook explicitly")
-            recorder.run([str(python), "setup.py", "build_py"], cwd=source, env=install_env)
-            llvm_root, llvm_detail = find_llvm_root(source)
-        if llvm_root is None:
-            raise RuntimeError("official build hook returned but did not produce a validated LLVM 17.0.6 toolchain: {}".format("; ".join(llvm_detail) or "no candidates"))
-        if not has_tvm_compiler_library(source):
-            raise RuntimeError("official build hook returned but did not produce TVM shared libraries under {}".format(source / "3rdparty" / "tvm" / "build"))
-    elif not prepared:
-        recorder.run([str(python), "-m", "pip", "install", "--no-deps", "-e", ".", "-v"], cwd=source, env={"MANUAL_BUILD": "1"})
+    recorder.log("setup stage: Python dependency validation")
+    python_probe = "import attrs, cloudpickle, decorator, ml_dtypes, numpy, psutil, scipy, tornado, typing_extensions"
+    imports = recorder.run([str(python), "-c", python_probe], cwd=source, env=runtime_env, check=False, capture=True)
+    if imports.returncode:
+        recorder.run([str(python), "-m", "pip", "install", "-r", str(EXPERIMENT_DIR / "python-requirements.txt"), "-c", str(EXPERIMENT_DIR / "python-constraints.txt")], cwd=source, env=runtime_env)
+    recorder.log("setup stage: T-MAC editable install with MANUAL_BUILD=1")
+    recorder.run([str(python), "-m", "pip", "install", "--no-deps", "-e", ".", "-v"], cwd=source, env=dict(runtime_env, MANUAL_BUILD="1"))
 
-    runtime_env = source_environment(source, llvm_root)
+    recorder.log("setup stage: fingerprinted TVM configure and build")
+    tvm_build, runtime_env = build_tvm_with_existing_llvm(recorder, source, llvm_root, deps_prefix, dependency_diagnostic, build_key)
     for command in ["clang", "clang++", "llvm-config"]:
         recorder.run([command, "--version"], cwd=source, env=runtime_env)
-    validate_tvm_build(recorder, source, python, runtime_env)
-    smoke_source = root / "loader-smoke.cpp"
-    smoke_binary = root / "loader-smoke"
-    smoke_source.write_text("#include <iostream>\nint main() { std::cout << \"runtime smoke test passed\\n\"; }\n", encoding="ascii")
-    recorder.run(["clang++", "-std=c++17", str(smoke_source), "-o", str(smoke_binary)], cwd=root, env=runtime_env)
-    recorder.run([str(smoke_binary)], cwd=root, env=runtime_env)
-    if shutil.which("ldd"):
-        recorder.run(["ldd", str(smoke_binary)], cwd=root, env=runtime_env)
-    stamp.write_text(current + "\n", encoding="ascii")
+    recorder.log("setup stage: TVM LLVM backend execution smoke")
+    validate_tvm_build(recorder, source, python, runtime_env, tvm_build)
+    recorder.log("setup stage: T-MAC NEON/FP16 kernel generation and execution smoke")
+    tmac_smoke = root / "checks" / "tmac-kernel" / build_key
+    tmac_smoke.mkdir(parents=True, exist_ok=True)
+    smoke_config = tmac_smoke / "config.json"
+    smoke_config.write_text(json.dumps(config["quantization"], indent=2) + "\n", encoding="utf-8")
+    recorder.run([str(python), str(EXPERIMENT_DIR / "scripts" / "smoke_tmac.py"), str(tmac_smoke), str(smoke_config)], cwd=source, env=runtime_env)
+    packages = recorder.run([str(python), "-m", "pip", "freeze", "--all"], cwd=source, env=runtime_env, capture=True)
+    (root / "python-packages.txt").write_text(packages.stdout, encoding="utf-8")
+    state = {"fingerprint": build_key, "setup_fingerprint": setup_fingerprint, "deps_fingerprint": dep_key, "deps_prefix": str(deps_prefix), "tvm_build": str(tvm_build), "llvm_root": str(llvm_root), "llvm": report, "dependency_diagnostic": dependency_diagnostic, "llvm_smoke": llvm_smoke, "tmac_smoke": str(tmac_smoke)}
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    stamp.write_text(build_key + "\n", encoding="ascii")
     recorder.log("setup completed with exact source commits: {}".format(commits))
 
 
@@ -855,6 +1188,7 @@ def baseline(config, recorder, result_dir):
     write_csv(result_dir / "operator.csv", operator_fields(), [])
     try:
         commits = verify_source(config, source)
+        validate_setup_state(config, commits, source)
         state["源码固定"] = True
         apply_patch(recorder, source)
         reference_result = self_test(config["operator"]["seed"])
@@ -942,13 +1276,17 @@ def main():
     result_dir.mkdir(parents=True, exist_ok=True)
     (result_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     recorder = Recorder(result_dir)
-    if args.command == "setup":
-        setup(config, recorder)
-    elif args.command == "baseline":
-        if not baseline(config, recorder, result_dir):
-            raise SystemExit(1)
-    else:
-        local_test(config, recorder)
+    try:
+        if args.command == "setup":
+            setup(config, recorder)
+        elif args.command == "baseline":
+            if not baseline(config, recorder, result_dir):
+                raise SystemExit(1)
+        else:
+            local_test(config, recorder)
+    except BaseException:
+        recorder.log(traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
