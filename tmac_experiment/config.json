@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "paths": {
-    "project_root": "/data/home/2300013234/kunpeng-llama-opt",
+    "project_root": "/data/home/2300013234/kunpeng-llama-opt/repo",
     "tmac_root": "/data/home/2300013234/kunpeng-llama-opt/tmac",
     "results_root": "/data/home/2300013234/kunpeng-llama-opt/results",
     "model": "/data/home/2300013234/kunpeng-llm/models/Meta-Llama-3-8B-Instruct-Q4_0.gguf",

@@ -132,7 +132,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("probe", "build", "check", "bench", "summarize", "bundle"))
     parser.add_argument("--config", type=pathlib.Path, default=EXP / "config.json")
-    parser.add_argument("--output", type=pathlib.Path, default=ROOT / "results/kunpeng")
+    parser.add_argument("--output", type=pathlib.Path, default=None)
     parser.add_argument("--source", type=pathlib.Path)
     parser.add_argument("--set", action="append", default=[])
     group = parser.add_mutually_exclusive_group()
@@ -141,7 +141,7 @@ def main():
     args = parser.parse_args()
     names = selected(args)
     config = legacy.load_config(args.config, args.set)
-    output = args.output.resolve()
+    output = (args.output or pathlib.Path(config["paths"]["results_root"]) / "kunpeng").resolve()
     if args.command == "probe":
         probe(output)
     elif args.command == "check":

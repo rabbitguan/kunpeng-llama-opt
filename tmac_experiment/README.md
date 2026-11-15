@@ -1,5 +1,27 @@
 # Kunpeng T-MAC baseline experiment
 
+## Current server layout (2026-11-15)
+
+Use `/data/home/2300013234/kunpeng-llama-opt/repo` as the only Git working tree. The parent directory is an experiment workspace, not a Git repository. Keep the existing `tmac`, `setup`, `builds`, and `tmac_baseline_clean_source` directories in place because dependency and venv files can contain absolute paths. Models stay under `/data/home/2300013234/kunpeng-llm/models`. These server dependencies and compiled outputs are intentionally separate from tracked application sources.
+
+The unified entry point now defaults to `paths.results_root/kunpeng`, outside the Git working tree. Override `--output` only when a separate run directory is needed. The config's `project_root` names the Git working tree; `tmac_root`, model and C1 build paths remain unchanged. Rerun setup after updating the config because its fingerprint includes configuration inputs.
+
+After stopping old experiment jobs, run `bash tmac_experiment/cleanup_server.sh --list` to inspect the explicit deletion list and then `bash tmac_experiment/cleanup_server.sh --apply` to remove old experiment scripts, backups and results. The script preserves the Git tree and known environment directories. It rejects symlink deletion targets and scans selected directories for common Python, LLVM and TVM environment markers before deleting anything. This scan is a guard, not a complete dependency detector; retained legacy sources and builds should be audited separately before removal. No environment is moved. Old instructions below that upload scripts to the workspace root or clone `kunpeng-round1-git` are historical; use the existing `repo` tree instead.
+
+Run from the Git tree:
+
+```sh
+cd /data/home/2300013234/kunpeng-llama-opt/repo
+bash tmac_experiment/cleanup_server.sh --list
+bash tmac_experiment/cleanup_server.sh --apply
+python3 tools/kunpeng_exp.py probe
+bash tmac_experiment/run.sh setup
+python3 tools/kunpeng_exp.py check --source /data/home/2300013234/kunpeng-llama-opt/tmac/source
+python3 tools/kunpeng_exp.py build --variants tmac_ref,A
+```
+
+Future updates use `git pull --ff-only origin experiment/tmac-baseline` in this directory. Keep local code edits in the development machine, and commit/push them before updating the server. Never use `git clean -fdx` for environment maintenance. Builds still require a fresh output directory when an identical snapshot already exists.
+
 This directory reproduces the unmodified T-MAC algorithm at upstream commit `7042f8f73330bd083bc1e4bc5ccb3f88a4904aee`. The only source patch adds a named Kunpeng AArch64 compilation target. It does not change LUT construction, table lookup, bit-plane accumulation, quantization, or grouping.
 
 ## Scope and verified source behavior
