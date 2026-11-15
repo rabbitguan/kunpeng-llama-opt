@@ -1,5 +1,11 @@
 # Kunpeng T-MAC baseline experiment
 
+## B loop-unrolling follow-up
+
+The first B server run passed the fixed correctness gates but slowed the 4096x4096 operator from 633.427 us to 897.015 us and decode from 3.3611 to 2.4910 tokens/s. Its probe assembly retained the eight-iteration inner loop and copied the eight LUT vectors to a stack array. The follow-up adds only full-unroll directives to the fixed eight-table load and lookup loops in `bitplane-fuse.h`. It does not change the B-v1 numerical contract, weight layout, scale/bias or group order. Local Apple ARM64 assembly now shows register-resident LUTs and expanded lookups; the FP32 partial-output array is still stack-backed. This is a code-generation observation, not Kunpeng speed evidence.
+
+Run `python3 tools/kunpeng_a.py --opts B --operator-only` for this follow-up. It reuses a reference operator harness from a successful run with matching frozen baseline and commits when available; otherwise it builds one. It builds only the revised optimized operator harness, repeats the 420-case B check, and measures one real 4096x4096 Q4_0 tensor with T=1, three warmups and ten rounds per backend. Ten rounds add only milliseconds of measured work. It skips llama-bench builds, model logits and full-model decode. Results live under `B_operator_compare_*`; `operator_pass_model_pending` explicitly means the full model has not been checked. Existing frozen source and previous result directories are not modified. Return the automatically printed logs archive, which includes probe assembly, correctness check results and raw operator timings. Only if the operator improves should full-model timing be repeated.
+
 ## B and AB first implementation
 
 Use the existing minimal runner with `python3 tools/kunpeng_a.py --opts B` to compare B alone against frozen T-MAC. `--opts A,B` selects the single AB combination; it does not run A and B as separate experiments. The default remains A. First run B only; no AB server measurement is required until B correctness and timings have been reviewed.

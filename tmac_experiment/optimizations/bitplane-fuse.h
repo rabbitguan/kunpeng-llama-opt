@@ -14,11 +14,13 @@ inline int32_t tmac_bitplane_fuse(const uint8_t * weights, const int8_t * lut, c
     const uint8x16_t mask = vdupq_n_u8(15);
     for (int group = 0; group < K / 32; ++group) {
         int8x16_t tables[8];
+#pragma clang loop unroll(full)
         for (int k = 0; k < 8; ++k) {
             tables[k] = vld1q_s8(lut + group * 128 + k * 16);
         }
         for (int block = 0; block < outputs / 8; ++block) {
             int16x8_t u0 = vdupq_n_s16(0), u1 = u0, u2 = u0, u3 = u0;
+#pragma clang loop unroll(full)
             for (int k = 0; k < 8; ++k) {
                 uint8x16_t packed = vld1q_u8(weights + group * BM * 4 + block * 128 + k * 16);
                 int8x16_t low = vqtbl1q_s8(tables[k], vandq_u8(packed, mask));

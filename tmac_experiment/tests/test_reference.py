@@ -178,3 +178,33 @@ class BExperimentTest(unittest.TestCase):
         self.assertEqual(b_logits_metrics([100.0], [102.0])["status"], "failed")
         self.assertEqual(b_logits_metrics([0.0], [0.001])["status"], "failed")
         self.assertEqual(b_logits_metrics([1.0], [float("nan")])["status"], "failed")
+
+
+class OperatorOnlyTest(unittest.TestCase):
+    def test_operator_summary_does_not_claim_model_pass(self):
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import operator_summary
+        rows = [{"variant": name, "lut_us": 1, "compute_us": time, "total_us": time + 1}
+                for name, time in [("tmac_ref", 10), ("B", 5)]]
+        result = operator_summary(rows, "B")
+        self.assertEqual(result["status"], "operator_pass_model_pending")
+        self.assertAlmostEqual(result["operator_speedup"], 11 / 6)
+        self.assertNotIn("decode_median_tokens_per_second", result)
+
+    def test_reference_harness_reuse_is_tied_to_same_baseline(self):
+        import json
+        import tempfile
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import reference_operator_harness
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            baseline = root / "basic_baseline"
+            baseline.mkdir()
+            run = root / "B_compare_01"
+            harness = run / "tmac_ref-harness"
+            harness.mkdir(parents=True)
+            (harness / "tmac-operator").write_text("fixture")
+            manifest = {"status": "preliminary_pass", "baseline": str(baseline), "commits": {"tmac": "fixed"}}
+            (run / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(reference_operator_harness(baseline, manifest), harness)
+            self.assertIsNone(reference_operator_harness(baseline, {"commits": {"tmac": "changed"}}))

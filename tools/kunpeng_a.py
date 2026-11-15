@@ -76,7 +76,46 @@ def b_logits_metrics(reference, actual):
             "nonfinite": 0, "nmse_limit": 0.001, "max_abs_limit": 1.0}
 
 
-def execute(baseline, output, recorder, opts="A"):
+def reference_operator_harness(baseline, frozen):
+    candidates = [baseline / "tmac_ref-harness"]
+    for path in sorted(baseline.parent.glob("*_compare_*/manifest.json"), reverse=True):
+        record = json.loads(path.read_text())
+        if record.get("status") == "preliminary_pass" and record.get("commits") == frozen["commits"] and record.get("baseline") == str(baseline):
+            candidates.append(path.parent / "tmac_ref-harness")
+    for path in candidates:
+        try:
+            exp.find_binary(path, "tmac-operator")
+            return path
+        except FileNotFoundError:
+            pass
+    return None
+
+
+def run_operator(config, output, recorder, name, prefix, harness, model, affinity, env, rounds=3):
+    env = env.copy()
+    env["TMAC_KCFG_FILE"] = str(prefix / "lib/kcfg.ini")
+    path = output / (name + "-operator.csv")
+    exp.write_csv(path, exp.operator_fields(), [])
+    recorder.run(affinity + [str(exp.find_binary(harness, "tmac-operator")), str(model), "4096", "4096", "1", str(rounds), "3", "20241025", str(path)], env=env)
+    operator_config = dict(config)
+    operator_config["operator"] = dict(config["operator"], shapes=[[4096, 4096]], tokens=[1])
+    failures, rows = exp.validate_operator_results(operator_config, path)
+    if len(rows) != rounds or failures:
+        raise RuntimeError("Operator check failed for " + name)
+    for row in rows:
+        if row["status"] != "pass" or any(not math.isfinite(float(row[key])) for key in ("lut_us", "compute_us", "total_us", "implementation_max_abs", "high_precision_max_abs")) or any(float(row[key]) <= 0 for key in ("lut_us", "compute_us", "total_us")):
+            raise RuntimeError("Invalid operator result for " + name)
+        row["variant"] = name
+    return rows
+
+
+def operator_summary(rows, variant):
+    stages = {name: {key: statistics.median(float(row[key]) for row in rows if row["variant"] == name) for key in ("lut_us", "compute_us", "total_us")} for name in ("tmac_ref", variant)}
+    return {"status": "operator_pass_model_pending", "operator_median_us": stages,
+            "operator_speedup": stages["tmac_ref"]["total_us"] / stages[variant]["total_us"]}
+
+
+def execute(baseline, output, recorder, opts="A", operator_only=False):
     if opts not in ("A", "B", "AB"):
         raise RuntimeError("Unsupported optimization combination")
     frozen = json.loads((baseline / "manifest.json").read_text())
@@ -129,7 +168,8 @@ def execute(baseline, output, recorder, opts="A"):
                 "numerical_contract": "B-v1-group32-fp32-fma" if "B" in opts else "upstream",
                 "optimization_sha256": {name: exp.sha256_file(exp.EXPERIMENT_DIR / "optimizations" / name) for name in (["A.patch"] if "A" in opts else []) + (["bitplane-fuse.h"] if "B" in opts else [])},
                 "generated_sha256": {name: exp.sha256_file(generated / name) for name in ("kernels.cc", "kernels.h", "kcfg.ini")},
-                "timing": "one process per backend, four tg32 samples, discard first; one real O=4096 K=4096 T=1 operator, three rounds",
+                "scope": "operator_only" if operator_only else "operator_and_model",
+                "timing": "one real O=4096 K=4096 T=1 operator, three warmups and ten rounds" if operator_only else "one process per backend, four tg32 samples, discard first; one real O=4096 K=4096 T=1 operator, three rounds",
                 "limitations": ["short single-thread preliminary comparison", "operator checks sample outputs", "dispatch initialization does not prove full operator coverage"]}
     write(output / "manifest.json", manifest)
     common = ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
@@ -138,12 +178,27 @@ def execute(baseline, output, recorder, opts="A"):
     recorder.run(["cmake", "--build", str(output / "tmac-build"), "--target", "install", "-j", "4"], env=env)
     harnesses = {}
     for name, prefix in (("tmac_ref", baseline / "install"), (opts, install)):
+        if operator_only and name == "tmac_ref":
+            previous = reference_operator_harness(baseline, frozen)
+            if previous:
+                harnesses[name] = previous
+                recorder.log("reuse reference operator harness: " + str(previous))
+                continue
         build = output / (name + "-harness")
         flags = common + ["-DLLAMA_SOURCE=" + str(fork), "-DGGML_NATIVE=ON", "-DGGML_TMAC=ON", "-DGGML_TMAC_TVM_THREADPOOL=OFF", "-DGGML_TMAC_RECHUNK=OFF", "-DCMAKE_PREFIX_PATH=" + str(prefix / "lib/cmake/t-mac")]
         recorder.run(["cmake", "-S", str(exp.EXPERIMENT_DIR / "harness"), "-B", str(build)] + flags, env=env)
-        targets = ["tmac-operator"] + (["tmac-logits"] if name == opts else [])
+        targets = ["tmac-operator"] + (["tmac-logits"] if name == opts and not operator_only else [])
         recorder.run(["cmake", "--build", str(build), "--target"] + targets + ["-j", "4"], env=env)
         harnesses[name] = build
+    if operator_only:
+        rows = []
+        for name, prefix in (("tmac_ref", baseline / "install"), (opts, install)):
+            rows.extend(run_operator(config, output, recorder, name, prefix, harnesses[name], model, affinity, env, rounds=10))
+            exp.write_csv(output / "operator.csv", exp.operator_fields(), rows)
+        write(output / "summary.json", operator_summary(rows, opts))
+        manifest.update({"status": "operator_pass_model_pending", "model_check": "not_run", "decode_check": "not_run", "operator_rounds": 10})
+        write(output / "manifest.json", manifest)
+        return
     opt_build = output / (opts + "-build")
     recorder.run(["cmake", "-S", str(fork), "-B", str(opt_build)] + common + ["-DGGML_NATIVE=ON", "-DGGML_TMAC=ON", "-DGGML_TMAC_TVM_THREADPOOL=OFF", "-DGGML_TMAC_RECHUNK=OFF", "-DCMAKE_PREFIX_PATH=" + str(install / "lib/cmake/t-mac")], env=env)
     recorder.run(["cmake", "--build", str(opt_build), "--target", "llama-bench", "-j", "4"], env=env)
@@ -166,19 +221,7 @@ def execute(baseline, output, recorder, opts="A"):
     operators, decode = [], []
     for name, prefix, binary in (("tmac_ref", baseline / "install", exp.find_binary(baseline / "tmac_ref-build", "llama-bench")), (opts, install, exp.find_binary(opt_build, "llama-bench"))):
         env["TMAC_KCFG_FILE"] = str(prefix / "lib/kcfg.ini")
-        operator_csv = output / (name + "-operator.csv")
-        exp.write_csv(operator_csv, exp.operator_fields(), [])
-        recorder.run(affinity + [str(exp.find_binary(harnesses[name], "tmac-operator")), str(model), "4096", "4096", "1", "3", "2", "20241025", str(operator_csv)], env=env)
-        operator_config = dict(config)
-        operator_config["operator"] = dict(config["operator"], shapes=[[4096, 4096]], tokens=[1])
-        failures, rows = exp.validate_operator_results(operator_config, operator_csv)
-        if len(rows) != 3 or failures:
-            raise RuntimeError("Operator check failed for " + name)
-        for row in rows:
-            if row["status"] != "pass" or any(not math.isfinite(float(row[key])) for key in ("lut_us", "compute_us", "total_us", "implementation_max_abs", "high_precision_max_abs")) or any(float(row[key]) <= 0 for key in ("lut_us", "compute_us", "total_us")):
-                raise RuntimeError("Invalid operator result for " + name)
-            row["variant"] = name
-        operators.extend(rows)
+        operators.extend(run_operator(config, output, recorder, name, prefix, harnesses[name], model, affinity, env))
         result = recorder.run(affinity + [str(binary), "-m", str(model), "-t", "1", "-ngl", "0", "-p", "0", "-n", "32", "-r", "4", "-b", "32", "-ub", "32", "-ctk", "f16", "-ctv", "f16", "-o", "jsonl"], env=env, capture=True)
         if "ggml_tmac_init" not in result.stdout or "Failed to find kcfg" in result.stdout:
             raise RuntimeError("Benchmark dispatch initialization failed for " + name)
@@ -197,16 +240,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=pathlib.Path)
     parser.add_argument("--opts", choices=["A", "B", "AB", "A,B", "B,A"], metavar="A|B|A,B", default="A")
+    parser.add_argument("--operator-only", action="store_true", help="one real matrix only; skip model logits and decode")
     args = parser.parse_args()
     opts = "AB" if args.opts in ("A,B", "B,A") else args.opts
     config = exp.load_config(exp.EXPERIMENT_DIR / "config.json", [])
     root = pathlib.Path(config["paths"]["results_root"])
     baseline = (args.baseline or find_baseline(root)).resolve()
-    output = root / (opts + "_compare_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    output = root / (opts + ("_operator_compare_" if args.operator_only else "_compare_") + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     output.mkdir(parents=True, exist_ok=False)
     recorder = exp.Recorder(output)
     try:
-        execute(baseline, output, recorder, opts)
+        execute(baseline, output, recorder, opts, operator_only=args.operator_only)
         print("Completed: " + str(output / "summary.json"))
     except Exception as error:
         recorder.log(str(error))
