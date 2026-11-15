@@ -3,7 +3,7 @@
 #include <arm_neon.h>
 #include <cstdint>
 
-// One group: eight INT8 terms per plane, so the weighted INT32 sum is at most 15360.
+// The partial bounds are 3072, 7168 and 15360, so the weighted merge fits INT16.
 template<int BM, int K>
 inline int32_t tmac_bitplane_fuse(const uint8_t * weights, const int8_t * lut, const float16_t * scales,
                                 const float16_t * lut_scales, const float16_t * biases, float16_t * output) {
@@ -30,12 +30,11 @@ inline int32_t tmac_bitplane_fuse(const uint8_t * weights, const int8_t * lut, c
                 u2 = vaddw_s8(u2, vget_low_s8(high));
                 u3 = vaddw_s8(u3, vget_high_s8(high));
             }
-            int32x4_t lower = vaddq_s32(vmovl_s16(vget_low_s16(u0)), vmulq_n_s32(vmovl_s16(vget_low_s16(u1)), 2));
-            lower = vaddq_s32(lower, vmulq_n_s32(vmovl_s16(vget_low_s16(u2)), 4));
-            lower = vaddq_s32(lower, vmulq_n_s32(vmovl_s16(vget_low_s16(u3)), 8));
-            int32x4_t upper = vaddq_s32(vmovl_high_s16(u0), vmulq_n_s32(vmovl_high_s16(u1), 2));
-            upper = vaddq_s32(upper, vmulq_n_s32(vmovl_high_s16(u2), 4));
-            upper = vaddq_s32(upper, vmulq_n_s32(vmovl_high_s16(u3), 8));
+            int16x8_t merged = vmlaq_n_s16(u0, u1, 2);
+            merged = vmlaq_n_s16(merged, u2, 4);
+            merged = vmlaq_n_s16(merged, u3, 8);
+            int32x4_t lower = vmovl_s16(vget_low_s16(merged));
+            int32x4_t upper = vmovl_high_s16(merged);
             float32x4_t low = vfmaq_n_f32(vdupq_n_f32(biases[group]), vcvtq_f32_s32(lower), lut_scales[group]);
             float32x4_t high = vfmaq_n_f32(vdupq_n_f32(biases[group]), vcvtq_f32_s32(upper), lut_scales[group]);
             float16x8_t d = vld1q_f16(scales + group * outputs + block * 8);

@@ -166,6 +166,7 @@ def execute(baseline, output, recorder, opts="A", operator_only=False):
     manifest = {"status": "building", "baseline": str(baseline), "commits": commits, "opts": list(opts), "layout": "upstream",
                 "model_sha256": frozen["model_sha256"], "affinity": affinity, "threads": 1,
                 "numerical_contract": "B-v1-group32-fp32-fma" if "B" in opts else "upstream",
+                "implementation": "B-v3-int16-merge-unroll8" if "B" in opts else "A",
                 "optimization_sha256": {name: exp.sha256_file(exp.EXPERIMENT_DIR / "optimizations" / name) for name in (["A.patch"] if "A" in opts else []) + (["bitplane-fuse.h"] if "B" in opts else [])},
                 "generated_sha256": {name: exp.sha256_file(generated / name) for name in ("kernels.cc", "kernels.h", "kcfg.ini")},
                 "scope": "operator_only" if operator_only else "operator_and_model",

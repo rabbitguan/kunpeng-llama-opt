@@ -1,5 +1,11 @@
 # Kunpeng T-MAC baseline experiment
 
+## Final small B attempt: INT16 merge
+
+The unrolled B follow-up still took 753.181 us versus 627.8715 us for original T-MAC on the tested 4096x4096 operator. The next small change merges the four plane sums with INT16 multiply-adds and widens only the final result for FP32 conversion. Each sum is bounded by 1024 in magnitude, and the successive weighted bounds are 3072, 7168 and 15360, all below 32768. Products by 2, 4 and 8 also fit; no intermediate can overflow. Thus this integer narrowing preserves the exact merged value and the existing B-v1 FP32 numerical contract. Weight layout, group boundaries, floating-point scale/bias handling and scheduling are unchanged. The manifest labels this implementation `B-v3-int16-merge-unroll8`; generated-source and header hashes distinguish it from prior results.
+
+Local ARM64 checks still pass all 420 cases against the independent scalar FP32 contract and double reference, and the 16 related Python tests pass. Local assembly shows the weighted combination using 16-bit shifts/adds before two final widening operations; Kunpeng performance remains pending. Use the same `python3 tools/kunpeng_a.py --opts B --operator-only` command. Only one real matrix is measured. If this version still has no reliable advantage over the reference, retain B as an unsuccessful experimental branch and stop adding B or full-model runs.
+
 ## B loop-unrolling follow-up
 
 The first B server run passed the fixed correctness gates but slowed the 4096x4096 operator from 633.427 us to 897.015 us and decode from 3.3611 to 2.4910 tokens/s. Its probe assembly retained the eight-iteration inner loop and copied the eight LUT vectors to a stack array. The follow-up adds only full-unroll directives to the fixed eight-table load and lookup loops in `bitplane-fuse.h`. It does not change the B-v1 numerical contract, weight layout, scale/bias or group order. Local Apple ARM64 assembly now shows register-resident LUTs and expanded lookups; the FP32 partial-output array is still stack-backed. This is a code-generation observation, not Kunpeng speed evidence.
