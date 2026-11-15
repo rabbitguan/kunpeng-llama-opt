@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#ifdef TMAC_CACHE_SCHEDULE
+#include "../optimizations/cache-schedule.h"
+#endif
+
 struct block_q4_0_local {
     ggml_fp16_t d;
     uint8_t qs[16];
@@ -64,7 +68,11 @@ static double elapsed_us(std::chrono::steady_clock::time_point start) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 9) {
+    if (argc != 9
+#ifdef TMAC_CACHE_SCHEDULE
+        && argc != 11
+#endif
+    ) {
         std::fprintf(stderr, "usage: %s MODEL O K T ROUNDS WARMUP SEED OUTPUT_CSV\n", argv[0]);
         return 2;
     }
@@ -78,6 +86,13 @@ int main(int argc, char ** argv) {
         int rounds = parse_positive(argv[5]);
         int warmup = parse_positive(argv[6]);
         int seed = parse_positive(argv[7]);
+#ifdef TMAC_CACHE_SCHEDULE
+        const int cache_r = argc == 11 ? parse_positive(argv[9]) : 0;
+        const int cache_bk = argc == 11 ? parse_positive(argv[10]) : 256;
+        std::string variant = cache_r ? "C-R" + std::to_string(cache_r) + "-BK" + std::to_string(cache_bk) : "tmac_ref";
+#else
+        std::string variant = "B0";
+#endif
         gguf_init_params params = {true, &metadata};
         gguf = gguf_init_from_file(model_path, params);
         if (!gguf || !metadata) {
@@ -117,6 +132,21 @@ int main(int argc, char ** argv) {
         int64_t weight_tile_bytes = weight_bytes / transformed->n_tile_num;
         int scale_tile_count = transformed->scales_size / transformed->n_tile_num;
 
+#ifdef TMAC_CACHE_SCHEDULE
+        kunpeng_cache::packed_weights cached;
+        std::vector<float16_t> partial;
+        double packing_us = 0.0;
+        if (tokens != 1 || tile_outputs != 64 || transformed->scales_size != output_channels * (input_channels / 32)) {
+            throw std::runtime_error("C requires T=1, bm=256 and weight groups=32");
+        }
+        if (cache_r) {
+            auto started = std::chrono::steady_clock::now();
+            cached = kunpeng_cache::pack(transformed->qweights, transformed->scales, transformed->n_tile_num, input_channels, cache_r, cache_bk);
+            partial.resize(cache_r * 256 + 31);
+            packing_us = elapsed_us(started);
+        }
+#endif
+
         std::mt19937 generator(seed);
         std::uniform_real_distribution<float> distribution(-4.0f, 4.0f);
         std::vector<float> activation_f32(static_cast<size_t>(tokens) * input_channels);
@@ -138,7 +168,7 @@ int main(int argc, char ** argv) {
                                             output_channels, input_channels, 1, 4);
             }
         };
-        auto compute = [&]() {
+        auto compute_reference = [&]() {
             for (int token = 0; token < tokens; ++token) {
                 for (int tile = 0; tile < transformed->n_tile_num; ++tile) {
                     ggml_tmac_mul_mat_task_compute(transformed->qweights + static_cast<int64_t>(tile) * weight_tile_bytes,
@@ -150,6 +180,16 @@ int main(int argc, char ** argv) {
                                                    tile_outputs, input_channels, 1, 4);
                 }
             }
+        };
+        auto compute = [&]() {
+#ifdef TMAC_CACHE_SCHEDULE
+            if (cache_r) {
+                kunpeng_cache_compute_v1(transformed->n_tile_num, input_channels, cache_r, cache_bk, cached.id,
+                    cached.weight_data(), cached.scale_data(), qlut.data(), lut_scales.data(), lut_biases.data(), output.data(), kunpeng_cache::aligned_data(partial));
+                return;
+            }
+#endif
+            compute_reference();
         };
         auto full = [&]() {
             convert_activation(activation_f32.data(), activation.data(), static_cast<int64_t>(activation_f32.size()));
@@ -164,6 +204,19 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < warmup; ++i) {
             full();
         }
+
+#ifdef TMAC_CACHE_SCHEDULE
+        if (cache_r) {
+            auto actual = output;
+            compute_reference();
+            if (std::memcmp(actual.data(), output.data(), output.size() * sizeof(tmac_float_type))) {
+                throw std::runtime_error("C output differs bitwise from frozen T-MAC");
+            }
+            for (auto value : output) {
+                if (!std::isfinite(float(value))) { throw std::runtime_error("nonfinite C output"); }
+            }
+        }
+#endif
 
         std::vector<int> sample_tokens = {0, tokens / 2, tokens - 1};
         std::vector<int> sample_outputs;
@@ -235,12 +288,19 @@ int main(int argc, char ** argv) {
             full();
             double total_us = elapsed_us(start);
             size_t workspace = qlut.size() * sizeof(int8_t) + (lut_scales.size() + lut_biases.size() + activation.size() + output.size()) * sizeof(tmac_float_type);
-            csv << "B0," << output_channels << ',' << input_channels << ',' << tokens << ',' << round
+#ifdef TMAC_CACHE_SCHEDULE
+            workspace += partial.size() * sizeof(float16_t);
+#endif
+            csv << variant << ',' << output_channels << ',' << input_channels << ',' << tokens << ',' << round
                 << ',' << lut_us << ',' << compute_us << ',' << total_us << ',' << workspace
                 << ',' << implementation_max_abs << ',' << implementation_nmse << ',' << high_precision_max_abs
                 << ",pass,repeated_n1," << tokens << ',' << tokens * transformed->n_tile_num << ',' << output_channels
                 << ',' << transformed->n_tile_num << ',' << sample_count << ',' << seed
-                << ",synthetic_uniform_-4_4," << weight->name << ";sample_tokens=0|T/2|T-1;sample_outputs=0..tile_outputs-1|O/2|O-1" << '\n';
+                << ",synthetic_uniform_-4_4," << weight->name
+#ifdef TMAC_CACHE_SCHEDULE
+                << ";layout_id=" << cached.id << ";packing_us=" << packing_us << ";R=" << cache_r << ";BK=" << cache_bk << ";partial_bytes=" << partial.size() * sizeof(float16_t) << ";packed_weight_bytes=" << cached.weights.size() << ";packed_scale_bytes=" << cached.scales.size() * sizeof(float16_t) << ";bitwise_check=" << (cache_r ? "pass" : "reference")
+#endif
+                << ";sample_tokens=0|T/2|T-1;sample_outputs=0..tile_outputs-1|O/2|O-1" << '\n';
         }
         ggml_tmac_free();
         gguf_free(gguf);

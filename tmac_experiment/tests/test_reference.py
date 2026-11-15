@@ -208,3 +208,19 @@ class OperatorOnlyTest(unittest.TestCase):
             (run / "manifest.json").write_text(json.dumps(manifest))
             self.assertEqual(reference_operator_harness(baseline, manifest), harness)
             self.assertIsNone(reference_operator_harness(baseline, {"commits": {"tmac": "changed"}}))
+
+
+class CacheScheduleTest(unittest.TestCase):
+    def test_cache_prototype_rejects_incompatible_frozen_config(self):
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_c import validate_config
+        config = json.loads((pathlib.Path(__file__).resolve().parents[1] / "config.json").read_text())
+        text = "[qgemm_lut_t1_int8_m16384_k4096_n1_b4]\nbm=256\nkfactor=8\ngroup_size=32\nsimd_n_in=16\nsimd_n_out=8\nlut_scales_size=128\nscales_size=524288\nn_tile_num=64\n"
+        validate_config({"config": config}, text)
+        for invalid in [text.replace("bm=256", "bm=128"), text.replace("kfactor=8", "kfactor=16"), text.replace("n_tile_num=64", "n_tile_num=32")]:
+            with self.assertRaises(RuntimeError):
+                validate_config({"config": config}, invalid)
+        config["quantization"]["fast_aggregation"] = True
+        with self.assertRaises(RuntimeError):
+            validate_config({"config": config}, text)
