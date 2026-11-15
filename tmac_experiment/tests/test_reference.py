@@ -148,3 +148,33 @@ class AExperimentTest(unittest.TestCase):
             header.unlink()
             with self.assertRaises(RuntimeError):
                 verify_artifacts(root, hashes)
+
+
+class BExperimentTest(unittest.TestCase):
+    def test_b_specialization_preserves_other_kernels_and_rejects_wrong_layout(self):
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_b import fuse_kernels
+        config = json.loads((pathlib.Path(__file__).resolve().parents[1] / "config.json").read_text())["quantization"]
+        cfg = "[qgemm_lut_t1_int8_m1024_k32_n1_b4]\nbm=256\ngroup_size=32\nkfactor=8\nsimd_n_in=16\nsimd_n_out=8\nlut_scales_size=1\nscales_size=256\nn_tile_num=4\n"
+        text = "int32_t qgemm_lut_t1_int8_m256_k32_n1_b4(void* A, void* LUT, void* Scales, void* LUT_Scales, void* LUT_Biases, void* C) { if (true) { old_path(); } return 0; }\nint preprocessor() { return 7; }"
+        result = fuse_kernels(text, cfg, config)
+        self.assertIn("tmac_bitplane_fuse<256, 32>", result)
+        self.assertNotIn("old_path", result)
+        self.assertIn("int preprocessor() { return 7; }", result)
+        for bad_cfg in [cfg.replace("kfactor=8", "kfactor=16"), cfg.replace("group_size=32", "group_size=128"), cfg.replace("scales_size=256", "scales_size=512")]:
+            with self.assertRaises(RuntimeError):
+                fuse_kernels(text, bad_cfg, config)
+        with self.assertRaises(RuntimeError):
+            fuse_kernels(text, cfg, dict(config, fast_aggregation=True))
+        with self.assertRaises(RuntimeError):
+            fuse_kernels(text.replace("void* C", "void* D"), cfg, config)
+
+    def test_b_model_error_gate_is_fixed_and_rejects_nonfinite(self):
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import b_logits_metrics
+        self.assertEqual(b_logits_metrics([1.0, 2.0], [1.001, 2.001])["status"], "pass")
+        self.assertEqual(b_logits_metrics([1.0], [1.1])["status"], "failed")
+        self.assertEqual(b_logits_metrics([100.0], [102.0])["status"], "failed")
+        self.assertEqual(b_logits_metrics([0.0], [0.001])["status"], "failed")
+        self.assertEqual(b_logits_metrics([1.0], [float("nan")])["status"], "failed")

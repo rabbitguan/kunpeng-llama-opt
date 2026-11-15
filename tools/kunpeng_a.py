@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal A versus frozen T-MAC experiment; no kernel tuning."""
+"""Minimal A/B/AB versus frozen T-MAC experiment; no kernel tuning."""
 import argparse
 import datetime
 import json
@@ -59,7 +59,26 @@ def verify_artifacts(baseline, hashes):
                 raise RuntimeError("Frozen artifact is missing or changed: " + str(path))
 
 
-def execute(baseline, output, recorder):
+def b_logits_metrics(reference, actual):
+    if not reference or len(reference) != len(actual):
+        raise RuntimeError("B logits dimensions differ")
+    nonfinite = sum(not math.isfinite(x) for x in reference + actual)
+    if nonfinite:
+        return {"status": "failed", "nonfinite": nonfinite}
+    errors = [abs(a - b) for a, b in zip(reference, actual)]
+    norm = sum(x * x for x in reference)
+    error = sum(x * x for x in errors)
+    nmse = error / norm if norm else (0.0 if error == 0 else math.inf)
+    maximum = max(errors)
+    return {"status": "pass" if nmse <= 0.001 and maximum <= 1.0 else "failed",
+            "nmse": nmse if math.isfinite(nmse) else None, "max_abs": maximum,
+            "max_relative_floor_0_01": max(e / max(0.01, abs(r)) for e, r in zip(errors, reference)),
+            "nonfinite": 0, "nmse_limit": 0.001, "max_abs_limit": 1.0}
+
+
+def execute(baseline, output, recorder, opts="A"):
+    if opts not in ("A", "B", "AB"):
+        raise RuntimeError("Unsupported optimization combination")
     frozen = json.loads((baseline / "manifest.json").read_text())
     if frozen.get("status") != "preliminary_pass" or frozen.get("opts") != []:
         raise RuntimeError("Baseline must be a completed unoptimized run")
@@ -81,24 +100,34 @@ def execute(baseline, output, recorder):
     if not cpus or exp.affinity_prefix(cpus[:1], config["model_benchmark"]["numa_node"]) != frozen["affinity"]:
         raise RuntimeError("CPU binding differs from baseline")
     affinity = frozen["affinity"]
-    check_lut(source, output)
+    if "A" in opts:
+        check_lut(source, output)
+    if "B" in opts:
+        from kunpeng_b import check_fused
+        check_fused(env, output, recorder)
     tree = output / "tmac-source"
     shutil.copytree(baseline / "tmac-source", tree, symlinks=True)
-    ctor = pathlib.Path("python/t_mac/intrins/lut_ctor.cc")
-    old = (tree / ctor).read_text()
-    recorder.run(["git", "apply", "--check", str(exp.EXPERIMENT_DIR / "optimizations/A.patch")], cwd=tree)
-    recorder.run(["git", "apply", str(exp.EXPERIMENT_DIR / "optimizations/A.patch")], cwd=tree)
+    text = (baseline / "generated/kernels.cc").read_text()
+    if "A" in opts:
+        ctor = pathlib.Path("python/t_mac/intrins/lut_ctor.cc")
+        old = (tree / ctor).read_text()
+        recorder.run(["git", "apply", "--check", str(exp.EXPERIMENT_DIR / "optimizations/A.patch")], cwd=tree)
+        recorder.run(["git", "apply", str(exp.EXPERIMENT_DIR / "optimizations/A.patch")], cwd=tree)
+        text = replace_constructor(text, old, (tree / ctor).read_text())
     generated = output / "generated"
     generated.mkdir()
     for name in ("kernels.h", "kcfg.ini"):
         shutil.copy2(baseline / "generated" / name, generated / name)
-    text = replace_constructor((baseline / "generated/kernels.cc").read_text(), old, (tree / ctor).read_text())
+    if "B" in opts:
+        from kunpeng_b import fuse_kernels
+        text = fuse_kernels(text, (generated / "kcfg.ini").read_text(), config["quantization"])
     (generated / "kernels.cc").write_text(text)
     for name in ("kernels.cc", "kernels.h", "kcfg.ini"):
         shutil.copy2(generated / name, tree / "deploy/tuned" / name)
-    manifest = {"status": "building", "baseline": str(baseline), "commits": commits, "opts": ["A"], "layout": "upstream",
+    manifest = {"status": "building", "baseline": str(baseline), "commits": commits, "opts": list(opts), "layout": "upstream",
                 "model_sha256": frozen["model_sha256"], "affinity": affinity, "threads": 1,
-                "patch_sha256": exp.sha256_file(exp.EXPERIMENT_DIR / "optimizations/A.patch"),
+                "numerical_contract": "B-v1-group32-fp32-fma" if "B" in opts else "upstream",
+                "optimization_sha256": {name: exp.sha256_file(exp.EXPERIMENT_DIR / "optimizations" / name) for name in (["A.patch"] if "A" in opts else []) + (["bitplane-fuse.h"] if "B" in opts else [])},
                 "generated_sha256": {name: exp.sha256_file(generated / name) for name in ("kernels.cc", "kernels.h", "kcfg.ini")},
                 "timing": "one process per backend, four tg32 samples, discard first; one real O=4096 K=4096 T=1 operator, three rounds",
                 "limitations": ["short single-thread preliminary comparison", "operator checks sample outputs", "dispatch initialization does not prove full operator coverage"]}
@@ -108,30 +137,34 @@ def execute(baseline, output, recorder):
     recorder.run(["cmake", "-S", str(tree), "-B", str(output / "tmac-build"), "-DCMAKE_INSTALL_PREFIX=" + str(install), "-DCMAKE_INSTALL_LIBDIR=lib", "-DTMAC_TVM=OFF"] + common, env=env)
     recorder.run(["cmake", "--build", str(output / "tmac-build"), "--target", "install", "-j", "4"], env=env)
     harnesses = {}
-    for name, prefix in (("tmac_ref", baseline / "install"), ("A", install)):
+    for name, prefix in (("tmac_ref", baseline / "install"), (opts, install)):
         build = output / (name + "-harness")
         flags = common + ["-DLLAMA_SOURCE=" + str(fork), "-DGGML_NATIVE=ON", "-DGGML_TMAC=ON", "-DGGML_TMAC_TVM_THREADPOOL=OFF", "-DGGML_TMAC_RECHUNK=OFF", "-DCMAKE_PREFIX_PATH=" + str(prefix / "lib/cmake/t-mac")]
         recorder.run(["cmake", "-S", str(exp.EXPERIMENT_DIR / "harness"), "-B", str(build)] + flags, env=env)
-        targets = ["tmac-operator"] + (["tmac-logits"] if name == "A" else [])
+        targets = ["tmac-operator"] + (["tmac-logits"] if name == opts else [])
         recorder.run(["cmake", "--build", str(build), "--target"] + targets + ["-j", "4"], env=env)
         harnesses[name] = build
-    a_build = output / "A-build"
-    recorder.run(["cmake", "-S", str(fork), "-B", str(a_build)] + common + ["-DGGML_NATIVE=ON", "-DGGML_TMAC=ON", "-DGGML_TMAC_TVM_THREADPOOL=OFF", "-DGGML_TMAC_RECHUNK=OFF", "-DCMAKE_PREFIX_PATH=" + str(install / "lib/cmake/t-mac")], env=env)
-    recorder.run(["cmake", "--build", str(a_build), "--target", "llama-bench", "-j", "4"], env=env)
+    opt_build = output / (opts + "-build")
+    recorder.run(["cmake", "-S", str(fork), "-B", str(opt_build)] + common + ["-DGGML_NATIVE=ON", "-DGGML_TMAC=ON", "-DGGML_TMAC_TVM_THREADPOOL=OFF", "-DGGML_TMAC_RECHUNK=OFF", "-DCMAKE_PREFIX_PATH=" + str(install / "lib/cmake/t-mac")], env=env)
+    recorder.run(["cmake", "--build", str(opt_build), "--target", "llama-bench", "-j", "4"], env=env)
     env["TMAC_KCFG_FILE"] = str(generated / "kcfg.ini")
-    logfile = output / "A-logits.bin"
-    result = recorder.run(affinity + [str(exp.find_binary(harnesses["A"], "tmac-logits")), str(model), str(logfile), "1", "128000,791,4062,14198,39935,35308,13"], env=env, capture=True)
+    logfile = output / (opts + "-logits.bin")
+    result = recorder.run(affinity + [str(exp.find_binary(harnesses[opts], "tmac-logits")), str(model), str(logfile), "1", "128000,791,4062,14198,39935,35308,13"], env=env, capture=True)
     if "ggml_tmac_init" not in result.stdout or "Failed to find kcfg" in result.stdout:
-        raise RuntimeError("A dispatch initialization failed")
+        raise RuntimeError(opts + " dispatch initialization failed")
     ref = exp.read_logits(baseline / "tmac_ref-logits.bin")
     actual = exp.read_logits(logfile)
     equal = logfile.read_bytes() == (baseline / "tmac_ref-logits.bin").read_bytes()
     finite = all(math.isfinite(x) for x in ref + actual)
-    write(output / "correctness.json", {"status": "pass" if equal and finite else "failed", "logits_bitwise_equal": equal, "all_finite": finite})
-    if not equal or not finite:
-        raise RuntimeError("A logits differ from frozen T-MAC; no valid timing result")
+    if "B" in opts:
+        correctness = b_logits_metrics(ref, actual)
+    else:
+        correctness = {"status": "pass" if equal and finite else "failed", "logits_bitwise_equal": equal, "all_finite": finite}
+    write(output / "correctness.json", correctness)
+    if correctness["status"] != "pass":
+        raise RuntimeError("Optimized logits failed the fixed error gate; no valid timing result")
     operators, decode = [], []
-    for name, prefix, binary in (("tmac_ref", baseline / "install", exp.find_binary(baseline / "tmac_ref-build", "llama-bench")), ("A", install, exp.find_binary(a_build, "llama-bench"))):
+    for name, prefix, binary in (("tmac_ref", baseline / "install", exp.find_binary(baseline / "tmac_ref-build", "llama-bench")), (opts, install, exp.find_binary(opt_build, "llama-bench"))):
         env["TMAC_KCFG_FILE"] = str(prefix / "lib/kcfg.ini")
         operator_csv = output / (name + "-operator.csv")
         exp.write_csv(operator_csv, exp.operator_fields(), [])
@@ -153,9 +186,9 @@ def execute(baseline, output, recorder):
         decode.extend({"variant": name, "round": i + 1, "tokens_per_second": value} for i, value in enumerate(bench_samples(result.stdout)))
         exp.write_csv(output / "operator.csv", exp.operator_fields(), operators)
         exp.write_csv(output / "decode.csv", ["variant", "round", "tokens_per_second"], decode)
-    speeds = {name: statistics.median(row["tokens_per_second"] for row in decode if row["variant"] == name) for name in ("tmac_ref", "A")}
+    speeds = {name: statistics.median(row["tokens_per_second"] for row in decode if row["variant"] == name) for name in ("tmac_ref", opts)}
     stages = {name: {key: statistics.median(float(row[key]) for row in operators if row["variant"] == name) for key in ("lut_us", "compute_us", "total_us")} for name in speeds}
-    write(output / "summary.json", {"status": "preliminary_pass", "decode_median_tokens_per_second": speeds, "A_over_tmac_decode": speeds["A"] / speeds["tmac_ref"], "operator_median_us": stages, "lut_speedup": stages["tmac_ref"]["lut_us"] / stages["A"]["lut_us"], "operator_speedup": stages["tmac_ref"]["total_us"] / stages["A"]["total_us"]})
+    write(output / "summary.json", {"status": "preliminary_pass", "decode_median_tokens_per_second": speeds, opts + "_over_tmac_decode": speeds[opts] / speeds["tmac_ref"], "operator_median_us": stages, "lut_speedup": stages["tmac_ref"]["lut_us"] / stages[opts]["lut_us"], "operator_speedup": stages["tmac_ref"]["total_us"] / stages[opts]["total_us"]})
     manifest["status"] = "preliminary_pass"
     write(output / "manifest.json", manifest)
 
@@ -163,15 +196,17 @@ def execute(baseline, output, recorder):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=pathlib.Path)
+    parser.add_argument("--opts", choices=["A", "B", "AB", "A,B", "B,A"], metavar="A|B|A,B", default="A")
     args = parser.parse_args()
+    opts = "AB" if args.opts in ("A,B", "B,A") else args.opts
     config = exp.load_config(exp.EXPERIMENT_DIR / "config.json", [])
     root = pathlib.Path(config["paths"]["results_root"])
     baseline = (args.baseline or find_baseline(root)).resolve()
-    output = root / ("A_compare_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    output = root / (opts + "_compare_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     output.mkdir(parents=True, exist_ok=False)
     recorder = exp.Recorder(output)
     try:
-        execute(baseline, output, recorder)
+        execute(baseline, output, recorder, opts)
         print("Completed: " + str(output / "summary.json"))
     except Exception as error:
         recorder.log(str(error))
