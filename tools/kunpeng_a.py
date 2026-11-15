@@ -49,6 +49,16 @@ def find_baseline(root):
     raise RuntimeError("No completed basic baseline found; pass --baseline explicitly")
 
 
+def verify_artifacts(baseline, hashes):
+    installed = {"kernels.cc": "lib/kernels.cc", "kernels.h": "include/t-mac/kernels.h", "kcfg.ini": "lib/kcfg.ini"}
+    if set(hashes) != set(installed):
+        raise RuntimeError("Unexpected frozen artifact manifest")
+    for name, expected in hashes.items():
+        for path in (baseline / "generated" / name, baseline / "install" / installed[name]):
+            if not path.is_file() or exp.sha256_file(path) != expected:
+                raise RuntimeError("Frozen artifact is missing or changed: " + str(path))
+
+
 def execute(baseline, output, recorder):
     frozen = json.loads((baseline / "manifest.json").read_text())
     if frozen.get("status") != "preliminary_pass" or frozen.get("opts") != []:
@@ -63,9 +73,7 @@ def execute(baseline, output, recorder):
     model = pathlib.Path(frozen["model"])
     if exp.sha256_file(model) != frozen["model_sha256"]:
         raise RuntimeError("Model checksum changed")
-    for name, expected in frozen["generated_sha256"].items():
-        if exp.sha256_file(baseline / "generated" / name) != expected or exp.sha256_file(baseline / "install/lib" / name) != expected:
-            raise RuntimeError("Frozen generated or installed artifact changed: " + name)
+    verify_artifacts(baseline, frozen["generated_sha256"])
     env = os.environ.copy()
     env.update(exp.source_environment(source))
     env.update({"OMP_NUM_THREADS": "1", "TVM_NUM_THREADS": "1"})

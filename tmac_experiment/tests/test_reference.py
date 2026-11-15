@@ -123,3 +123,28 @@ class AExperimentTest(unittest.TestCase):
                 path.mkdir()
                 (path / "manifest.json").write_text(json.dumps({"status": status, "opts": []}))
             self.assertEqual(find_baseline(root), root / "basic_baseline_01")
+
+
+    def test_frozen_artifacts_follow_actual_install_layout(self):
+        import tempfile
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import verify_artifacts, exp
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            hashes = {}
+            for name, installed in [("kernels.cc", "lib/kernels.cc"), ("kernels.h", "include/t-mac/kernels.h"), ("kcfg.ini", "lib/kcfg.ini")]:
+                generated = root / "generated" / name
+                target = root / "install" / installed
+                generated.parent.mkdir(parents=True, exist_ok=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                generated.write_text(name)
+                target.write_text(name)
+                hashes[name] = exp.sha256_file(generated)
+            verify_artifacts(root, hashes)
+            header = root / "install/include/t-mac/kernels.h"
+            header.write_text("changed")
+            with self.assertRaises(RuntimeError):
+                verify_artifacts(root, hashes)
+            header.unlink()
+            with self.assertRaises(RuntimeError):
+                verify_artifacts(root, hashes)
