@@ -48,3 +48,23 @@ class VariantTest(unittest.TestCase):
         for opts, variants in [("A,A", ""), ("Z", ""), (None, "unknown"), (None, "A,A")]:
             with self.assertRaises(ValueError):
                 selected(argparse.Namespace(opts=opts, variants=variants))
+
+    def test_lut_check_uses_project_toolchain_environment(self):
+        import tempfile
+        from unittest import mock
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        import kunpeng_exp
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source"
+            original = source / "python/t_mac/intrins/lut_ctor.cc"
+            original.parent.mkdir(parents=True)
+            original.write_text("fixture")
+            (root / "setup-environment.json").write_text("{}")
+            env = {"PATH": "/project/llvm/bin", "LD_LIBRARY_PATH": "/project/llvm/lib"}
+            with mock.patch.object(kunpeng_exp.platform, "machine", return_value="aarch64"), mock.patch.object(kunpeng_exp.legacy, "sha256_file", return_value="f03f1fb0e9acd1cc9679fbdb1d47dc2599f97806eba7d5b0bd996fa8da9e386b"), mock.patch.object(kunpeng_exp.legacy, "source_environment", return_value=env), mock.patch.object(kunpeng_exp.shutil, "which", return_value="/project/llvm/bin/clang++") as which, mock.patch.object(kunpeng_exp, "run", return_value="pass") as run:
+                kunpeng_exp.check_lut(source, root / "output")
+            which.assert_called_once_with("clang++", path=env["PATH"])
+            for call in run.call_args_list[2:]:
+                self.assertEqual(call.kwargs["env"]["PATH"], env["PATH"])
+                self.assertEqual(call.kwargs["env"]["LD_LIBRARY_PATH"], env["LD_LIBRARY_PATH"])

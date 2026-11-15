@@ -63,6 +63,9 @@ def check_lut(source, output):
     original = source / "python/t_mac/intrins/lut_ctor.cc"
     if legacy.sha256_file(original) != "f03f1fb0e9acd1cc9679fbdb1d47dc2599f97806eba7d5b0bd996fa8da9e386b":
         raise RuntimeError("LUT source differs from pinned original")
+    runtime_env = os.environ.copy()
+    if (source.parent / "setup-environment.json").is_file():
+        runtime_env.update(legacy.source_environment(source))
     with tempfile.TemporaryDirectory() as tmp:
         work = pathlib.Path(tmp)
         target = work / "python/t_mac/intrins/lut_ctor.cc"
@@ -75,17 +78,17 @@ def check_lut(source, output):
             wrapper = work / (name + ".cpp")
             wrapper.write_text('#define partial_max_reset partial_max_reset_' + name + '\n#define partial_max_g4_int8_k8 partial_max_g4_int8_k8_' + name + '\n#include "' + str(path) + '"\nextern "C" void lut_' + name + '(int k, int8_t *q, float16_t *b, float16_t *s, float16_t *bias) { lut_ctor_g4_int8_impl<0,4>(k,q,b,s,bias); }\n')
             wrappers.append(wrapper)
-        compiler = shutil.which("clang++")
+        compiler = shutil.which("clang++", path=runtime_env.get("PATH"))
         if not compiler:
             raise RuntimeError("clang++ missing")
         flags = ["-O3", "-std=c++17", "-march=armv8.2-a+fp16"]
         binary = work / "check-lut"
-        run([compiler] + flags + wrappers + [EXP / "harness/lut-store.cpp", "-o", binary])
-        result = run([binary])
+        run([compiler] + flags + wrappers + [EXP / "harness/lut-store.cpp", "-o", binary], env=runtime_env)
+        result = run([binary], env=runtime_env)
         output.mkdir(parents=True, exist_ok=True)
-        run([compiler] + flags + ["-S", wrappers[1], "-o", output / "lut-A.s"])
-        run([compiler] + flags + ["-S", wrappers[0], "-o", output / "lut-ref.s"])
-        write(output / "lut-check.json", {"status": "pass", "result": result, "compiler": run([compiler, "--version"]), "patch_sha256": legacy.sha256_file(EXP / "optimizations/A.patch")})
+        run([compiler] + flags + ["-S", wrappers[1], "-o", output / "lut-A.s"], env=runtime_env)
+        run([compiler] + flags + ["-S", wrappers[0], "-o", output / "lut-ref.s"], env=runtime_env)
+        write(output / "lut-check.json", {"status": "pass", "result": result, "compiler": run([compiler, "--version"], env=runtime_env), "patch_sha256": legacy.sha256_file(EXP / "optimizations/A.patch")})
         print(result, end="")
 
 
