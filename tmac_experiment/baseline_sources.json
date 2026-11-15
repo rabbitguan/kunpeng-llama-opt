@@ -1,0 +1,26 @@
+{
+  "llama_ref": {
+    "url": "https://github.com/ggml-org/llama.cpp.git",
+    "commit": "dca1d4b58a7f1acf1bd253be84e50d6367f492fd"
+  },
+  "integrated_fork": {
+    "commit": "eb07ecf0172230d58fff5d23a3fd6feebda35065",
+    "extra_commits": [
+      "481426c8b61bf93c49a883045b0ad7f2198f3836",
+      "d0716d7eb3d81fbcceaf0735a7cb3472ec462de1",
+      "2a3efb0dad81333b2aa9e25e4b8c241a39d2f5b6",
+      "8a2b8215904c6c5dddfc57ccbbd45d27125d51f2",
+      "da59e4d852815588bdbfa0fbc05fbbac9e5a71b6",
+      "fb1246cd9ae4e118937b0c6c6e8f93206c1ec36b",
+      "7e75b8465f9ce685e13f99205eaf432d215abea5",
+      "81ffd4cd27d41d02d170e34d6e349092a4e323bf",
+      "7f5b43c7ced64772415704f64e1765e665077ed6",
+      "908fabc20aed31448b7b734d74ea8142cf211205",
+      "fde57d01c01d1cb5f97b4df9780c756e672976d9",
+      "f0ac8a544abb995dc43b62b14c42a86b231d56dd",
+      "0aa5c210da4da8a98c77ccfc3b5b859d0af060c9",
+      "eb07ecf0172230d58fff5d23a3fd6feebda35065"
+    ]
+  },
+  "evidence": "https://api.github.com/repos/kaleid-liner/llama.cpp/compare/ggml-org:master...eb07ecf0172230d58fff5d23a3fd6feebda35065"
+}

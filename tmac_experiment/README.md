@@ -1,5 +1,15 @@
 # Kunpeng T-MAC baseline experiment
 
+## Minimal baseline run
+
+After setup and LUT checks have passed, run `python3 tools/kunpeng_baseline.py` from the server Git tree. This builds only strict upstream llama.cpp and original T-MAC, with no A/B/C changes and no autotuning. It uses official T-MAC fallback parameters and the preset Llama-3-8B Q4 shapes; this is a preliminary untuned baseline, not the final tuned reference. Results are timestamped outside the repository and a small logs archive is always produced, including on failure.
+
+The llama.cpp upstream pin is `dca1d4b58a7f1acf1bd253be84e50d6367f492fd`, the merge base of current upstream master and the pinned integrated fork `eb07ecf0172230d58fff5d23a3fd6feebda35065`. `baseline_sources.json` records the read-only GitHub comparison and all 14 fork commits above that base. Source snapshots use `git archive` of exact revisions; only the named Kunpeng target patch is applied to the T-MAC snapshot. LLVM/TVM/Python are reused from the validated setup. T-MAC's official generated-C/no-TVM-threadpool integration is selected; installing its headers and C source uses `TMAC_TVM=OFF` to avoid rebuilding TVM. The generated C source is still compiled into the fork with Clang. Upstream ARM flags and native optimization defaults remain enabled; OpenMP uses each version's defaults. Per-build CMake cache and compile_commands.json preserve the actual options.
+
+The basic gate compares final logits for seven fixed Llama-3 token IDs between the two backends. Both outputs must be finite and their normalized squared error must be at most 0.01, a fixed initial smoke threshold. Raw logits and maximum absolute error are retained; this does not establish general model quality. Failure stops timing. T-MAC initialization and missing-kcfg messages are checked, but per-operator dispatch coverage remains unverified.
+
+Timing uses one allowed physical CPU on the configured NUMA node, one thread, FP16 KV, no prompt, 32 generated tokens, one discarded warmup run and three measured runs per backend. Backends run sequentially. The runner records the same model SHA256, each round, medians, ms/token and preliminary throughput ratio. This is short zero-prompt decode, not long-context inference or prefill. Each invocation loads the model, while llama-bench's internal decode interval supplies the timing. Kernel generation, installation and model loading remain outside that interval. Detailed operator checks, model-derived kernel shapes, quota hierarchy auditing and per-operator coverage are deferred. Do not label the quick run as a fully frozen tuned tmac_ref.
+
 ## Current server layout (2026-11-15)
 
 Use `/data/home/2300013234/kunpeng-llama-opt/repo` as the only Git working tree. The parent directory is an experiment workspace, not a Git repository. Keep the existing `tmac`, `setup`, `builds`, and `tmac_baseline_clean_source` directories in place because dependency and venv files can contain absolute paths. Models stay under `/data/home/2300013234/kunpeng-llm/models`. These server dependencies and compiled outputs are intentionally separate from tracked application sources.

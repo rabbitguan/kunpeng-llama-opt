@@ -68,3 +68,25 @@ class VariantTest(unittest.TestCase):
             for call in run.call_args_list[2:]:
                 self.assertEqual(call.kwargs["env"]["PATH"], env["PATH"])
                 self.assertEqual(call.kwargs["env"]["LD_LIBRARY_PATH"], env["LD_LIBRARY_PATH"])
+
+
+class BasicBaselineTest(unittest.TestCase):
+    def test_logits_gate_rejects_invalid_and_large_errors(self):
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_baseline import compare_logits
+        self.assertEqual(compare_logits([1.0, -1.0], [1.0, -1.0])["status"], "pass")
+        self.assertEqual(compare_logits([1.0], [2.0])["status"], "failed")
+        self.assertEqual(compare_logits([1.0], [float("nan")])["status"], "failed")
+        self.assertEqual(compare_logits([float("inf")], [1.0])["status"], "failed")
+        self.assertEqual(compare_logits([0.0], [1.0])["status"], "failed")
+        self.assertEqual(compare_logits([0.0], [0.0])["status"], "pass")
+        with self.assertRaises(RuntimeError):
+            compare_logits([1.0], [])
+
+    def test_baseline_source_pin_matches_provenance(self):
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_baseline import UPSTREAM
+        provenance = json.loads((pathlib.Path(__file__).resolve().parents[1] / "baseline_sources.json").read_text())
+        self.assertEqual(UPSTREAM, provenance["llama_ref"]["commit"])
+        self.assertEqual(len(provenance["integrated_fork"]["extra_commits"]), 14)
