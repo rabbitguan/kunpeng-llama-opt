@@ -1,5 +1,13 @@
 # Kunpeng T-MAC baseline experiment
 
+## C follow-up on the larger K matrix without rebuilding
+
+Use `python3 tools/kunpeng_c.py --k 14336 --reuse-run /absolute/path/to/completed/C_operator_compare_RUN`. The runner requires a successful C operator manifest with the same baseline, commits, model checksum and header hash; the installed generated-source hash must also match. Missing or mismatched artifacts fail instead of triggering a rebuild. The existing runtime C entry handles the requested K, and the original frozen kcfg is checked for its O=4096,K=14336,bm=256 kernel. The same real-GGUF tensor selection and full-output bitwise check remain active for this matrix. The previous run directory is read only; new raw results and a new manifest are written separately.
+
+This matrix has 56 KiB of pure LUT data versus 16 KiB at K=4096. It is a more relevant additional test for the cache-reuse hypothesis, not a guarantee of benefit. Reuse mode runs R=0,1,2,4 and then 4,2,1,0, five measured rounds per process with three warmups. Each configuration still totals ten samples, and pass identifiers are retained. The summary reports R=2 and R=4 relative to R=1 as well as each variant relative to the original consumer. R=1 has no cross-tile joint reuse, so a gain shared with R=1 cannot by itself establish the intended cache-scheduling benefit. No model inference, compilation, kernel generation or tuning is performed in reuse mode. Model hashing and offline packing still occur.
+
+The K=14336 metadata gate was checked against the actual returned baseline kcfg. Local ARM64 tests also compared the unchanged C kernel with the original tile-first reference for 81 larger-K layout/schedule/input cases. Server correctness and timing for the real larger matrix remain pending. This change updates only the Python runner, tests and documentation; the installed C kernel remains unchanged.
+
 ## Minimal C layout/schedule prototype
 
 Run `python3 tools/kunpeng_c.py` on the server after the basic baseline. This is an operator-only C prototype; no A/B, model loading, decode, new thread policy or tuning is added. It compares the frozen tile-first path with R=1,2,4 at BK=256 on one real O=K=4096 Q4_0 tensor, with T=1, one CPU, three warmups and ten rounds. BM=256 is the expanded bit-plane dimension, corresponding to 64 logical output channels per tile. The actual frozen kcfg is checked before building; other layouts fail explicitly.

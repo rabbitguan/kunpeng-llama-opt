@@ -224,3 +224,32 @@ class CacheScheduleTest(unittest.TestCase):
         config["quantization"]["fast_aggregation"] = True
         with self.assertRaises(RuntimeError):
             validate_config({"config": config}, text)
+
+    def test_cache_large_k_requires_matching_frozen_kernel(self):
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_c import validate_config
+        config = json.loads((pathlib.Path(__file__).resolve().parents[1] / "config.json").read_text())
+        cfg = "[qgemm_lut_t1_int8_m16384_k14336_n1_b4]\nbm=256\nkfactor=8\ngroup_size=32\nsimd_n_in=16\nsimd_n_out=8\nlut_scales_size=448\nscales_size=1835008\nn_tile_num=64\n"
+        validate_config({"config": config}, cfg, 14336)
+        with self.assertRaises(RuntimeError):
+            validate_config({"config": config}, cfg, 4096)
+
+    def test_cache_reuse_rejects_modified_source(self):
+        import tempfile
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_c import reusable_manifest, exp, HEADER
+        with tempfile.TemporaryDirectory() as directory:
+            run = pathlib.Path(directory)
+            source = run / "install/lib/kernels.cc"
+            source.parent.mkdir(parents=True)
+            source.write_text("frozen")
+            frozen = {"commits": {"tmac": "pinned"}, "model_sha256": "model"}
+            baseline = run / "baseline"
+            record = dict(frozen, status="operator_pass_model_pending", opts=["C"], baseline=str(baseline), header_sha256=exp.sha256_file(HEADER), kernels_sha256=exp.sha256_file(source))
+            (run / "manifest.json").write_text(json.dumps(record))
+            self.assertEqual(reusable_manifest(run, baseline, frozen), record)
+            source.write_text("changed")
+            with self.assertRaises(RuntimeError):
+                reusable_manifest(run, baseline, frozen)
