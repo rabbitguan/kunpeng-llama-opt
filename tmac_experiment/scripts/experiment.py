@@ -513,6 +513,8 @@ def local_pkg_config_environment(prefix, env):
     value = os.pathsep.join(str(path) for path in directories)
     result["PKG_CONFIG_PATH"] = value
     result["PKG_CONFIG_LIBDIR"] = value
+    # pkgconf can filter our -L paths because they are also in LIBRARY_PATH.
+    result["PKG_CONFIG_ALLOW_SYSTEM_LIBS"] = "1"
     return result
 
 

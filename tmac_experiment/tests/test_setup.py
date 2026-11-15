@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -191,7 +192,7 @@ class SetupTest(unittest.TestCase):
         (headers / "term.h").write_text("/* test */\n", encoding="ascii")
         pc = prefix / "lib" / "pkgconfig"
         pc.mkdir(parents=True)
-        (pc / pc_name).write_text("prefix={}\nName: tinfo\nVersion: 6.5\nLibs: -L${{prefix}}/lib -ltinfo\nCflags: -I${{prefix}}/include\n".format(prefix), encoding="ascii")
+        (pc / pc_name).write_text("prefix={}\nName: tinfo\nDescription: test tinfo package\nVersion: 6.5\nLibs: -L${{prefix}}/lib -ltinfo\nCflags: -I${{prefix}}/include\n".format(prefix), encoding="ascii")
         return prefix
 
     def test_tinfo_headers_in_ncurses_subdirectory_are_selected(self):
@@ -231,6 +232,23 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(metadata["errors"], [])
             self.assertTrue(all(env["PKG_CONFIG_LIBDIR"].startswith(str(prefix)) for env in environments))
             self.assertTrue(all("/old/system/pkgconfig" not in env["PKG_CONFIG_LIBDIR"] for env in environments))
+            self.assertTrue(all(env["PKG_CONFIG_ALLOW_SYSTEM_LIBS"] == "1" for env in environments))
+
+    @unittest.skipUnless(shutil.which("pkg-config"), "pkg-config is unavailable")
+    def test_tinfo_library_path_survives_pkg_config_filtering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = self.make_tinfo_prefix(pathlib.Path(directory))
+            lib = str(prefix / "lib")
+            env = os.environ.copy()
+            env.update({"PKG_CONFIG_PATH": str(prefix / "lib/pkgconfig"),
+                        "PKG_CONFIG_LIBDIR": str(prefix / "lib/pkgconfig"),
+                        "LIBRARY_PATH": lib, "PKG_CONFIG_SYSTEM_LIBRARY_PATH": lib})
+            env.pop("PKG_CONFIG_ALLOW_SYSTEM_LIBS", None)
+            filtered = subprocess.check_output(["pkg-config", "--libs", "tinfo"], env=env, text=True)
+            self.assertNotIn("-L" + lib, filtered.split())
+            metadata = tinfo_pkg_config(prefix, env)
+            self.assertEqual(metadata["errors"], [])
+            self.assertIn("-L" + lib, metadata["ldflags"])
 
     def test_tinfo_recipe_change_changes_cache_and_build_directory(self):
         manifest = {"packages": {"tinfo": {"sha256": "archive"}}}
