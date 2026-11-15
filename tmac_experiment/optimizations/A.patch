@@ -1,0 +1,83 @@
+--- a/python/t_mac/intrins/lut_ctor.cc
++++ b/python/t_mac/intrins/lut_ctor.cc
+@@ -84,37 +84,49 @@
+             vec_qlut[g] = vqmovn_s16(vcvtnq_s16_f16(vec_lut[g]));
+         }
+ 
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16          + g, vec_qlut[g], 0);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16     + g, vec_qlut[g], 1);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16 * 2 + g, vec_qlut[g], 2);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16 * 3 + g, vec_qlut[g], 3);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16 * 4 + g, vec_qlut[g], 4);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16 * 5 + g, vec_qlut[g], 5);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16 * 6 + g, vec_qlut[g], 6);
+-        }
+-#pragma unroll
+-        for (int g = 0; g < 16; ++g) {
+-            vst1_lane_s8(qlut + k * 8 * 16 + 16 * 7 + g, vec_qlut[g], 7);
++        int8x8_t rows[2][8];
++#pragma unroll
++        for (int half = 0; half < 2; ++half) {
++            int8x8_t x[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                x[i] = vec_qlut[half * 8 + i];
++            }
++#pragma unroll
++            for (int base = 0; base < 8; base += 2) {
++#pragma unroll
++                for (int j = 0; j < 1; ++j) {
++                    int8x8x2_t v = vtrn_s8(x[base + j], x[base + j + 1]);
++                    x[base + j] = v.val[0];
++                    x[base + j + 1] = v.val[1];
++                }
++            }
++#pragma unroll
++            for (int base = 0; base < 8; base += 4) {
++#pragma unroll
++                for (int j = 0; j < 2; ++j) {
++                    int16x4x2_t v = vtrn_s16(vreinterpret_s16_s8(x[base + j]), vreinterpret_s16_s8(x[base + j + 2]));
++                    x[base + j] = vreinterpret_s8_s16(v.val[0]);
++                    x[base + j + 2] = vreinterpret_s8_s16(v.val[1]);
++                }
++            }
++#pragma unroll
++            for (int base = 0; base < 8; base += 8) {
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    int32x2x2_t v = vtrn_s32(vreinterpret_s32_s8(x[base + j]), vreinterpret_s32_s8(x[base + j + 4]));
++                    x[base + j] = vreinterpret_s8_s32(v.val[0]);
++                    x[base + j + 4] = vreinterpret_s8_s32(v.val[1]);
++                }
++            }
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                rows[half][i] = x[i];
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            vst1q_s8(qlut + k * 128 + i * 16, vcombine_s8(rows[0][i], rows[1][i]));
+         }
+     }
+ #elif defined __AVX2__

@@ -35,3 +35,16 @@ class ReferenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VariantTest(unittest.TestCase):
+    def test_selection_distinguishes_sequence_and_combination(self):
+        import argparse
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_exp import selected
+        self.assertEqual(selected(argparse.Namespace(opts=None, variants="A,B,AB")), ["A", "B", "AB"])
+        self.assertEqual(selected(argparse.Namespace(opts="B,A", variants="")), ["AB"])
+        self.assertEqual(selected(argparse.Namespace(opts="", variants="")), ["tmac_off"])
+        for opts, variants in [("A,A", ""), ("Z", ""), (None, "unknown"), (None, "A,A")]:
+            with self.assertRaises(ValueError):
+                selected(argparse.Namespace(opts=opts, variants=variants))

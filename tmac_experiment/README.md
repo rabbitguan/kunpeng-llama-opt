@@ -67,3 +67,49 @@ bash tmac_experiment/run.sh local-test
 The C++ harnesses are compiled and executed by `baseline`; no extra manual command is required. On non-AArch64 development machines only the scalar tests run. ARM kernel correctness, operator timings, logits comparison, dynamic loading, NUMA binding, and end-to-end measurements remain pending until the server run. A failed configuration is written with `status=failed`; it is not accepted as a performance result. Model dispatch is accepted only when B0 output contains `ggml_tmac_init`, has no missing-kcfg fatal message, and exits successfully.
 
 Directories for future `baseline`, `A`, `B`, and `AB` variants are reserved in configuration only. No A/B algorithm change is implemented here.
+
+## Experimental A delivery (2026-11-13)
+
+This is a partial implementation of the requested nine-variant experiment. Do not use it to claim a completed three-baseline comparison. The old `baseline` command and its B0/C0/C1 labels retain their original meaning.
+
+New files:
+
+- `../tools/kunpeng_exp.py`: probe, isolated T-MAC/A builds, local checks, source bundle and conservative raw-result collection. `bench` deliberately fails until per-variant operator/model correctness gates are connected. `--variants A,B,AB` selects three experiments; `--opts A,B` selects AB. Unsupported implementations fail explicitly.
+- `optimizations/A.patch`: opt-in change to the pinned `lut_ctor.cc` only. Three transpose stages on each 8x8 half produce eight contiguous 16-byte stores. The quantization, scale/bias, loop bounds and output layout are unchanged. This patch is outside `patches/`, so legacy setup never applies it to the reference.
+- `harness/lut-store.cpp`: actual original/optimized NEON comparison, including buffer canaries, zero, small, signed random and larger input, 32/64/96/128 activation spans. These spans exercise the original constructor's supported multiple-of-32 contract; this does not add arbitrary tails.
+
+The unified build creates separate source snapshots, generated kernels, tuning directories, libraries and harnesses for `tmac_ref`, `A`, and `--opts ''` (unoptimized development control). LLVM, TVM, venv and read-only llama.cpp dependencies are reused. Rebuilding an existing snapshot fails; choose a new output directory. Both B0 and C0 helper binaries are produced internally by the reused builder; only B0 corresponds to the requested T-MAC variant. These C0 binaries are not `llama_ref`. All builds remain `built_pending_correctness`. Snapshot sources do not contain Git metadata; source commit provenance comes from verified original repositories. The builder rejects unexpected tracked source changes, but the two allowed adaptation files still require review against the saved patches before freezing a formal reference.
+
+Confirmed versions: workspace `9f15bbedd2c67bfe0233e379dd27efa35450796a`, T-MAC `7042f8f73330bd083bc1e4bc5ccb3f88a4904aee`, integrated llama.cpp fork `eb07ecf0172230d58fff5d23a3fd6feebda35065`, TVM `36b9535ff364c484d04b384555106731049f44cd`; setup requires LLVM 17.0.6. The fixed T-MAC archive was downloaded and inspected locally. No local model file or complete server toolchain was found. The configured GGUF path is a server path; its metadata, shapes and SHA256 remain unverified locally.
+
+Source locations in the pinned T-MAC tree: `python/t_mac/model_utils.py` and `tools/` handle conversion; the llama.cpp fork's `ggml/src/ggml-tmac.cpp` handles loading/packing and task dispatch; `python/t_mac/intrins/lut_ctor.cc` constructs LUTs; `python/t_mac/intrins/tbl.cc` handles lookup, integer partial sums, conversion and scaling; `python/t_mac/ops/qgemm.py` defines CBits, final bit-plane combination and scheduling; `deploy/compile.py` generates kernels. `N=T`, expanded `M=O*bits`. The kfactor filter requires both `(k*g) % act_group_size == 0` and `weight_group_size % (k*g) == 0`; of official candidates 8 and 16 only 8 survives at groups=32,g=4.
+
+B is not implemented. The existing tensorized path converts/scales partial sums and accumulates FP16 CBits per group, followed by an FP32 bit-plane combination. Integer fusion requires a new tensorization contract and grouped output reduction, not a coefficient substitution. C is not implemented. Existing scheduling places CBits under output tile `mo` with inner K traversal; cache-block interleaving requires coordinated runtime task boundaries and a versioned packing layout. Consequently B/AB/C/AC/BC/ABC fail at build/check, and no performance result is accepted. Strict upstream `llama_ref` is also not implemented: the fork's exact upstream ancestor and non-TMAC modifications must be audited before selecting a matching upstream commit. Native CPU optimizations must remain enabled for that future baseline.
+
+Local validation on Apple ARM64: original and A constructors compiled at `-O3 -march=armv8.2-a+fp16`, compared byte/scale/bias equality for 1,600 cases. Generated assembly for both is saved by `check`. This is neither Linux ABI verification nor Kunpeng performance evidence. A introduces transpose instructions and register pressure; store count in source is not a speedup measurement. Existing scalar/setup tests also pass. Generated TVM kernels, actual model metadata/weight equivalence, operator checks, logits checks, all-off equivalence, CPU binding/quota enforcement and formal performance experiments remain pending.
+
+Commands for the implemented portion (replace `SERVER` with your SSH destination; use an independent server directory):
+
+```sh
+# Local
+python3 tools/kunpeng_exp.py check --output /tmp/kunpeng-local
+python3 tools/kunpeng_exp.py bundle --output /tmp/kunpeng-bundle
+scp /tmp/kunpeng-bundle/kunpeng-experiment.tar.gz SERVER:~/kunpeng-experiment.tar.gz
+
+# Server: existing project LLVM must be at the configured tmac/source/build path.
+mkdir -p ~/kunpeng-round1
+cd ~/kunpeng-round1
+tar -xzf ~/kunpeng-experiment.tar.gz
+python3 tools/kunpeng_exp.py probe --output results/environment
+bash tmac_experiment/run.sh setup
+python3 tools/kunpeng_exp.py check --source /data/home/2300013234/kunpeng-llama-opt/tmac/source --output results/check
+python3 tools/kunpeng_exp.py build --variants tmac_ref,A --output results/build-round1
+python3 tools/kunpeng_exp.py build --opts '' --output results/build-control
+python3 tools/kunpeng_exp.py summarize --output results
+
+tar -czf ~/kunpeng-round1-results.tar.gz results/environment results/check
+# Local
+scp SERVER:~/kunpeng-round1-results.tar.gz /tmp/
+```
+
+The archived config preserves existing server model/toolchain paths. Override those with `--set paths.model=...`, `--set paths.tmac_root=...`, and `--set paths.results_root=...` consistently for setup and build; setup validates configuration fingerprints. Do not replace system compilers or delete prior baselines/results. Build manifests are under `results/build-round1/variants/*/*/manifest.json`; return these and console logs as well, including failed runs. `check` with no `--source` runs scalar/setup tests only; even with `--source` it does not certify operator/model correctness. No executable formal bench command is supplied because the required gates and other variants are incomplete.
