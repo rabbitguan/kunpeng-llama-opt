@@ -90,3 +90,36 @@ class BasicBaselineTest(unittest.TestCase):
         provenance = json.loads((pathlib.Path(__file__).resolve().parents[1] / "baseline_sources.json").read_text())
         self.assertEqual(UPSTREAM, provenance["llama_ref"]["commit"])
         self.assertEqual(len(provenance["integrated_fork"]["extra_commits"]), 14)
+
+
+class AExperimentTest(unittest.TestCase):
+    def test_generated_kernel_edit_is_limited_to_constructor(self):
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import replace_constructor
+        self.assertEqual(replace_constructor("lookup;OLD;output", "OLD", "NEW"), "lookup;NEW;output")
+        for kernel, old, new in [("missing", "OLD", "NEW"), ("OLDOLD", "OLD", "NEW"), ("OLD", "OLD", "OLD")]:
+            with self.assertRaises(RuntimeError):
+                replace_constructor(kernel, old, new)
+
+    def test_benchmark_samples_discard_first_without_rounding(self):
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import bench_samples
+        row = {"n_gen": 32, "n_prompt": 0, "samples_ns": [1000000000, 2000000000, 4000000000, 8000000000]}
+        self.assertEqual(bench_samples("initialization log\n" + json.dumps(row)), [16.0, 8.0, 4.0])
+        for change in [{"samples_ns": [1, 2, 3]}, {"n_gen": 16}, {"n_prompt": 1}, {"samples_ns": [1, 2, 3, 0]}]:
+            with self.assertRaises(RuntimeError):
+                bench_samples(json.dumps(dict(row, **change)))
+
+    def test_baseline_discovery_ignores_failed_runs(self):
+        import tempfile
+        import json
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_a import find_baseline
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for name, status in [("basic_baseline_01", "preliminary_pass"), ("basic_baseline_02", "building")]:
+                path = root / name
+                path.mkdir()
+                (path / "manifest.json").write_text(json.dumps({"status": status, "opts": []}))
+            self.assertEqual(find_baseline(root), root / "basic_baseline_01")
