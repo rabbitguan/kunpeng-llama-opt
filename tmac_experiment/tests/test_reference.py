@@ -92,6 +92,72 @@ class BasicBaselineTest(unittest.TestCase):
         self.assertEqual(len(provenance["integrated_fork"]["extra_commits"]), 14)
 
 
+class RepackBaselineTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+
+    def test_probe_requires_active_features_and_sve_vector_length(self):
+        from kunpeng_llama_baseline import repack_cases
+        probe = dict.fromkeys(("neon", "dotprod", "i8mm", "sve", "fp16"), 1)
+        self.assertEqual(len(repack_cases(dict(probe, sve_bytes=32, llamafile=0))[0]), 2)
+        cases, skipped = repack_cases(dict(probe, sve_bytes=32))
+        self.assertEqual([kernel for _, kernel in cases], ["4x4", "8x8"])
+        self.assertEqual(skipped, {})
+        cases, skipped = repack_cases(dict(probe, sve_bytes=16))
+        self.assertEqual([kernel for _, kernel in cases], ["4x4"])
+        self.assertIn("llama_repack_8x8", skipped)
+        for feature in probe:
+            with self.assertRaises(RuntimeError):
+                repack_cases(dict(probe, **{feature: 0}, sve_bytes=32))
+
+    def test_dispatch_gate_requires_actual_layout_and_buffer(self):
+        from kunpeng_llama_baseline import check_dispatch
+        ok = "Q4_0 repack kernel: requested=4x4 selected=4x4\nCPU_REPACK model buffer size"
+        check_dispatch(ok, "4x4")
+        for text in (ok.replace("selected=4x4", "selected=8x8"), ok.replace("CPU_REPACK", "CPU"), ""):
+            with self.assertRaises(RuntimeError):
+                check_dispatch(text, "4x4")
+
+    def test_compile_audit_preserves_feature_overrides(self):
+        from kunpeng_llama_baseline import ARM_ARCH, isa_commands
+        entries = [{"file": "/source/ggml/src/" + name, "arguments": ["clang", "-O3", "-DGGML_USE_CPU_REPACK", "-march=" + ARM_ARCH, "-U__ARM_FEATURE_SVE", "-c", name]}
+                   for name in ("ggml-cpu/ggml-cpu.cpp", "ggml-cpu/repack.cpp", "ggml-cpu/arch/arm/quants.c")]
+        commands = isa_commands(entries)
+        self.assertTrue(all("-U__ARM_FEATURE_SVE" in value for value in commands.values()))
+        for broken in (entries[:-1], entries + entries[:1]):
+            with self.assertRaises(RuntimeError):
+                isa_commands(broken)
+        entries[0]["arguments"].append("-DGGML_USE_TMAC")
+        with self.assertRaises(RuntimeError):
+            isa_commands(entries)
+
+    def test_macro_gate_requires_all_isa_features(self):
+        from kunpeng_llama_baseline import FEATURES, check_macros
+        text = "\n".join("#define " + name + " 1" for name in FEATURES)
+        check_macros(text)
+        with self.assertRaises(RuntimeError):
+            check_macros(text.replace("#define __ARM_FEATURE_SVE 1", ""))
+
+    def test_benchmark_checks_repack_metadata_and_keeps_raw_samples(self):
+        import json
+        import tempfile
+        from unittest import mock
+        from types import SimpleNamespace
+        from kunpeng_llama_baseline import benchmark
+        record = {"q4_kernel": "4x4", "repack": True, "n_threads": 1, "n_gen": 32, "n_prompt": 0, "samples_ns": [1e9, 2e9, 4e9, 8e9]}
+        dispatch = "Q4_0 repack kernel: requested=4x4 selected=4x4\nCPU_REPACK model buffer size\n"
+        recorder = mock.Mock()
+        recorder.run.return_value = SimpleNamespace(stdout=dispatch + json.dumps(record))
+        with tempfile.TemporaryDirectory() as directory, mock.patch("kunpeng_llama_baseline.runtime_state", return_value={}):
+            rows = benchmark("llama_repack_4x4", "bench", "model", pathlib.Path(directory), recorder, ["taskset", "-c", "0"], {}, "4x4")
+            self.assertEqual([r["tokens_per_second"] for r in rows], [16.0, 8.0, 4.0])
+            self.assertIn("-v", recorder.run.call_args.args[0])
+            self.assertIn("--repack", recorder.run.call_args.args[0])
+            recorder.run.return_value = SimpleNamespace(stdout=dispatch + json.dumps(dict(record, repack=False)))
+            with self.assertRaises(RuntimeError):
+                benchmark("llama_repack_4x4", "bench", "model", pathlib.Path(directory), recorder, ["taskset", "-c", "0"], {}, "4x4")
+
+
 class AExperimentTest(unittest.TestCase):
     def test_generated_kernel_edit_is_limited_to_constructor(self):
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
