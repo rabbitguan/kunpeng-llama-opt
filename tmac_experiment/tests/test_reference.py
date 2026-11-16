@@ -253,3 +253,20 @@ class CacheScheduleTest(unittest.TestCase):
             source.write_text("changed")
             with self.assertRaises(RuntimeError):
                 reusable_manifest(run, baseline, frozen)
+
+    def test_cache_two_config_summary_keeps_pass_differences(self):
+        import argparse
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+        from kunpeng_c import parse_r_list, comparison_summary
+        self.assertEqual(parse_r_list("1,4"), (1, 4))
+        for invalid in ["1,1", "4", "1,8", ""]:
+            with self.assertRaises(argparse.ArgumentTypeError):
+                parse_r_list(invalid)
+        rows = [{"variant": name, "total_us": time, "note": ";pass=" + str(p)}
+                for p, name, time in [(1, "C-R1-BK256", 6000), (1, "C-R4-BK256", 2000),
+                                      (2, "C-R1-BK256", 2000), (2, "C-R4-BK256", 2000)]]
+        result = comparison_summary(rows)
+        self.assertFalse(result["original_reference_measured"])
+        self.assertEqual(result["operator_speedups"], {})
+        self.assertEqual(result["pass_tile_reuse_speedups"]["1"]["C-R4-BK256"], 3)
+        self.assertEqual(result["pass_tile_reuse_speedups"]["2"]["C-R4-BK256"], 1)

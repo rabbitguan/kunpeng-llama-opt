@@ -1,5 +1,9 @@
 # Kunpeng T-MAC baseline experiment
 
+## Short R=1 versus R=4 confirmation
+
+Add `--r-list 1,4` to the larger-K reuse command to measure only those two controls. Reuse mode executes orders 1,4 and 4,1, five samples per process, retaining ten samples per configuration. It does not compile or load the full model. The same complete-output bitwise gate is active in each process. The summary now preserves per-pass medians and R=4/R=1 throughput ratios, so an anomalously slow R=1 pass is not hidden by a pooled median. Raw samples are never removed. When R=0 is not selected, `original_reference_measured` is false and `operator_speedups` is empty; this follow-up does not claim a new comparison against original T-MAC. Kernel sources, layout, rounding and installed binaries are unchanged.
+
 ## C follow-up on the larger K matrix without rebuilding
 
 Use `python3 tools/kunpeng_c.py --k 14336 --reuse-run /absolute/path/to/completed/C_operator_compare_RUN`. The runner requires a successful C operator manifest with the same baseline, commits, model checksum and header hash; the installed generated-source hash must also match. Missing or mismatched artifacts fail instead of triggering a rebuild. The existing runtime C entry handles the requested K, and the original frozen kcfg is checked for its O=4096,K=14336,bm=256 kernel. The same real-GGUF tensor selection and full-output bitwise check remain active for this matrix. The previous run directory is read only; new raw results and a new manifest are written separately.

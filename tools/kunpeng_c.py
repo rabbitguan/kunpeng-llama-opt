@@ -45,7 +45,30 @@ def reusable_manifest(reuse, baseline, frozen):
     return dict(record)
 
 
-def execute(baseline, output, recorder, k=4096, reuse=None):
+def parse_r_list(value):
+    values = value.split(",")
+    if any(x not in ("0", "1", "2", "4") for x in values) or len(values) != len(set(values)) or "1" not in values:
+        raise argparse.ArgumentTypeError("use distinct R values from 0,1,2,4 and include R=1")
+    return tuple(int(x) for x in values)
+
+
+def comparison_summary(rows):
+    def medians(group):
+        return {name: statistics.median(float(row["total_us"]) for row in group if row["variant"] == name) for name in sorted({row["variant"] for row in group})}
+    def reuse_ratios(values):
+        return {name: values["C-R1-BK256"] / value for name, value in values.items() if name not in ("C-R1-BK256", "tmac_ref")}
+    values = medians(rows)
+    passes = sorted({row["note"].rsplit(";pass=", 1)[1] for row in rows})
+    by_pass = {p: medians([row for row in rows if row["note"].endswith(";pass=" + p)]) for p in passes}
+    return {"status": "operator_pass_model_pending", "total_us_medians": values,
+            "tile_reuse_speedups": reuse_ratios(values),
+            "original_reference_measured": "tmac_ref" in values,
+            "operator_speedups": {name: values["tmac_ref"] / value for name, value in values.items() if name != "tmac_ref"} if "tmac_ref" in values else {},
+            "pass_total_us_medians": by_pass,
+            "pass_tile_reuse_speedups": {p: reuse_ratios(v) for p, v in by_pass.items()}}
+
+
+def execute(baseline, output, recorder, k=4096, reuse=None, r_values=(0, 1, 2, 4)):
     if platform.system() != "Linux" or platform.machine() != "aarch64":
         raise RuntimeError("Run the C experiment on the Linux AArch64 server")
     frozen = json.loads((baseline / "manifest.json").read_text())
@@ -106,8 +129,9 @@ def execute(baseline, output, recorder, k=4096, reuse=None):
     manifest["status"] = "testing"
     write(output / "manifest.json", manifest)
     all_rows = []
-    orders = ((0, 1, 2, 4), (4, 2, 1, 0)) if reuse is not None else ((0, 1, 2, 4),)
+    orders = (r_values, tuple(reversed(r_values))) if reuse is not None else (r_values,)
     rounds = 5 if reuse is not None else 10
+    manifest["R"] = [r for r in r_values if r]
     manifest["orders"] = orders
     manifest["rounds_per_process"] = rounds
     write(output / "manifest.json", manifest)
@@ -129,10 +153,7 @@ def execute(baseline, output, recorder, k=4096, reuse=None):
                 row["note"] += ";pass=" + str(pass_index + 1)
             all_rows.extend(rows)
             exp.write_csv(output / "operator.csv", exp.operator_fields(), all_rows)
-    medians = {name: statistics.median(float(row["total_us"]) for row in all_rows if row["variant"] == name) for name in sorted({row["variant"] for row in all_rows})}
-    write(output / "summary.json", {"status": "operator_pass_model_pending", "total_us_medians": medians,
-          "tile_reuse_speedups": {name: medians["C-R1-BK256"] / medians[name] for name in ("C-R2-BK256", "C-R4-BK256")},
-          "operator_speedups": {name: medians["tmac_ref"] / value for name, value in medians.items() if name != "tmac_ref"}})
+    write(output / "summary.json", comparison_summary(all_rows))
     manifest["status"] = "operator_pass_model_pending"
     write(output / "manifest.json", manifest)
 
@@ -144,13 +165,14 @@ def main():
     parser.add_argument("--baseline", type=pathlib.Path)
     parser.add_argument("--k", type=int, choices=[4096, 14336], default=4096)
     parser.add_argument("--reuse-run", type=pathlib.Path, help="reuse a completed C run; never rebuild")
+    parser.add_argument("--r-list", type=parse_r_list, default="0,1,2,4", help="configs to measure; R=0 is the original consumer")
     args = parser.parse_args()
     baseline = (args.baseline or find_baseline(root)).resolve()
     output = root / ("C_operator_compare_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     output.mkdir(parents=True, exist_ok=False)
     recorder = exp.Recorder(output)
     try:
-        execute(baseline, output, recorder, args.k, args.reuse_run.resolve() if args.reuse_run else None)
+        execute(baseline, output, recorder, args.k, args.reuse_run.resolve() if args.reuse_run else None, args.r_list)
         print("Completed: " + str(output / "summary.json"))
     except Exception as error:
         recorder.log(str(error))
