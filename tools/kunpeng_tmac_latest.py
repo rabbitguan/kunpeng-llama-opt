@@ -132,6 +132,32 @@ def tmac_package_flags(prefix):
     return [f"-DTMAC_DIR={prefix / 'lib/cmake/t-mac'}"]
 
 
+def tmac_package_config():
+    return (
+        'get_filename_component(_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)\n'
+        'set(TMAC_KERNELS_SOURCE "${_prefix}/lib/kernels.cc")\n'
+        'add_library(t_mac_no_tvm INTERFACE)\n'
+        'target_include_directories(t_mac_no_tvm INTERFACE "${_prefix}/include")\n'
+        'include(CheckCXXSourceCompiles)\n'
+        'check_cxx_source_compiles("int main() { _Float16 value = 0; return sizeof(value) != 2; }" TMAC_HAS_FLOAT16)\n'
+        'if(NOT TMAC_HAS_FLOAT16)\n'
+        '    target_compile_definitions(t_mac_no_tvm INTERFACE TMAC_HALF_STORAGE_FALLBACK=1)\n'
+        'endif()\n')
+
+
+def half_storage_source(source):
+    anchor = "typedef _Float16 half;"
+    if not source.count(anchor):
+        raise ValueError("Expected generated T-MAC half typedefs")
+    return source.replace(anchor,
+        "#ifdef TMAC_HALF_STORAGE_FALLBACK\n"
+        "typedef __fp16 half;\n"
+        "#else\n"
+        "typedef _Float16 half;\n"
+        "#endif\n"
+        'static_assert(sizeof(half) == 2, "T-MAC requires 16-bit half storage");')
+
+
 def neon_broadcast_source(source):
     anchor = "inline int32_t tbl_g4_int8_float_update_impl("
     if source.count(anchor) != 1:
@@ -230,21 +256,18 @@ def execute(args):
     write(out / "manifest.json", manifest)
     shutil.copy2(generated / "kernels.h", prefix / "include/t-mac/kernels.h")
     original_kernel = (generated / "kernels.cc").read_text()
-    compiled_kernel = neon_broadcast_source(original_kernel)
+    compiled_kernel = half_storage_source(neon_broadcast_source(original_kernel))
     (prefix / "lib/kernels.cc").write_text(compiled_kernel)
     (out / "neon-broadcast.patch").write_text("".join(difflib.unified_diff(
         original_kernel.splitlines(keepends=True), compiled_kernel.splitlines(keepends=True),
         fromfile="original/kernels.cc", tofile="compiled/kernels.cc")))
     manifest["kernel_compatibility"] = "explicit_neon_fp16_scalar_broadcasts"
+    manifest["half_storage_compatibility"] = "compiler_probe_with_arm_fp16_fallback"
     manifest["compiled_kernel_sha256"] = digest(prefix / "lib/kernels.cc")
     write(out / "manifest.json", manifest)
     shutil.copy2(generated / "kcfg.ini", prefix / "lib/kcfg.ini")
     env["TMAC_KCFG_FILE"] = str(prefix / "lib/kcfg.ini")
-    (prefix / "lib/cmake/t-mac/TMACConfig.cmake").write_text(
-        'get_filename_component(_prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)\n'
-        'set(TMAC_KERNELS_SOURCE "${_prefix}/lib/kernels.cc")\n'
-        'add_library(t_mac_no_tvm INTERFACE)\n'
-        'target_include_directories(t_mac_no_tvm INTERFACE "${_prefix}/include")\n')
+    (prefix / "lib/cmake/t-mac/TMACConfig.cmake").write_text(tmac_package_config())
     binaries = {}
     for variant, tree in trees.items():
         build = out / (variant + "-build")
@@ -255,6 +278,9 @@ def execute(args):
         flags += [f"-DLLAMA_SOURCE={tree}", f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *tmac_package_flags(prefix)]
         run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
         binaries[variant] = build
+    tmac_cache = (binaries["tmac"] / "CMakeCache.txt").read_text()
+    manifest["compiled_half_storage"] = "_Float16" if "TMAC_HAS_FLOAT16:INTERNAL=1" in tmac_cache else "__fp16"
+    write(out / "manifest.json", manifest)
     for variant in ("tmac", "native"):
         build = binaries[variant]
         targets = ["llama-bench", "tmac-latest-logits"] + (["tmac-latest-check"] if variant == "tmac" else [])
@@ -330,6 +356,15 @@ def main():
                 manifest.update(status="failed", error=str(error))
                 write(manifest_path, manifest)
         print(f"Failed: {error}", file=sys.stderr)
+        build_log = args.out / "build.log"
+        if isinstance(error, subprocess.CalledProcessError) and build_log.exists():
+            lines = build_log.read_text(errors="replace").splitlines()
+            matches = [index for index, line in enumerate(lines)
+                       if re.search(r"error:|CMake Error|undefined reference|Error:|Killed|No rule to make target", line)]
+            if matches:
+                index = matches[0]
+                print(f"First build error from {build_log}:", file=sys.stderr)
+                print("\n".join(lines[max(0, index - 3):index + 10]), file=sys.stderr)
         return 1
     finally:
         if args.out.exists():

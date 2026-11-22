@@ -4,6 +4,7 @@ from pathlib import Path
 import struct
 import shutil
 import subprocess
+import platform
 import tempfile
 import unittest
 from unittest import mock
@@ -36,15 +37,36 @@ class LatestTest(unittest.TestCase):
             root = Path(directory)
             package = root / "prefix/lib/cmake/t-mac"
             package.mkdir(parents=True)
-            (package / "TMACConfig.cmake").write_text("add_library(t_mac_no_tvm INTERFACE)\n")
+            (package / "TMACConfig.cmake").write_text(latest.tmac_package_config())
             source = root / "source"
             source.mkdir()
             (source / "CMakeLists.txt").write_text(
-                "cmake_minimum_required(VERSION 3.22)\nproject(check NONE)\nfind_package(TMAC REQUIRED CONFIG)\n"
-                'if(NOT TARGET t_mac_no_tvm)\nmessage(FATAL_ERROR "Missing T-MAC target")\nendif()\n')
-            subprocess.run(["cmake", "-S", str(source), "-B", str(root / "build"),
-                            *latest.tmac_package_flags(root / "prefix")],
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
+                "cmake_minimum_required(VERSION 3.22)\nproject(check LANGUAGES CXX)\nfind_package(TMAC REQUIRED CONFIG)\n"
+                "add_executable(probe probe.cpp)\ntarget_compile_features(probe PRIVATE cxx_std_17)\n"
+                "target_link_libraries(probe PRIVATE t_mac_no_tvm)\n")
+            probe = latest.half_storage_source("typedef _Float16 half;\n")
+            probe += "int main() { half value = 1; return sizeof(value) != 2 || float(value) != 1; }\n"
+            (source / "probe.cpp").write_text(probe)
+            modes = [False, True] if platform.machine().lower() in ("arm64", "aarch64") else [False]
+            for fallback in modes:
+                build = root / ("fallback" if fallback else "native")
+                flags = ["-DTMAC_HAS_FLOAT16:INTERNAL="] if fallback else []
+                subprocess.run(["cmake", "-S", str(source), "-B", str(build),
+                                *latest.tmac_package_flags(root / "prefix"), *flags],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
+                result = subprocess.run(["cmake", "--build", str(build)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                subprocess.run([str(build / "probe")], check=True)
+
+    def test_half_storage_adapts_each_generated_declaration(self):
+        source = "typedef _Float16 half;\n// next kernel\ntypedef _Float16 half;\n"
+        result = latest.half_storage_source(source)
+        self.assertEqual(result.count("typedef __fp16 half;"), 2)
+        self.assertEqual(result.count("typedef _Float16 half;"), 2)
+        self.assertIn("// next kernel", result)
+        with self.assertRaises(ValueError):
+            latest.half_storage_source("typedef float half;")
 
     def test_host_change_requires_explicit_option(self):
         profile = {"hostname": "cnkunpengb01", "node": 0, "cpus": list(range(0, 64, 2))}
