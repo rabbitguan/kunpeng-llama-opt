@@ -3,6 +3,9 @@
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
+#ifdef GGML_USE_TMAC
+#include "tmac/tmac.h"
+#endif
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
@@ -42,6 +45,12 @@
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
     static std::vector<ggml_backend_buffer_type_t> bufts = []() {
         std::vector<ggml_backend_buffer_type_t> bufts;
+
+#ifdef GGML_USE_TMAC
+        if (ggml_backend_cpu_tmac_buffer_type()) {
+            bufts.push_back(ggml_backend_cpu_tmac_buffer_type());
+        }
+#endif
 
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
         if (ggml_backend_amx_buffer_type()) {
