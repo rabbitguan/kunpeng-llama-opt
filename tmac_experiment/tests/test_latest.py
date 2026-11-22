@@ -16,6 +16,18 @@ SPEC.loader.exec_module(latest)
 
 
 class LatestTest(unittest.TestCase):
+    def test_half_probe_reads_ascii_entry_from_non_utf8_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "CMakeCache.txt"
+            for value, expected in ((b"1", "_Float16"), (b"", "__fp16"), (b"0", "__fp16")):
+                cache.write_bytes(b"// generated binary metadata: \xe0\x80\xff\nTMAC_HAS_FLOAT16:INTERNAL=" + value + b"\n")
+                self.assertEqual(latest.compiled_half_storage(cache), expected)
+            for data in (b"", b"TMAC_HAS_FLOAT16:INTERNAL=unexpected\n",
+                         b"TMAC_HAS_FLOAT16:INTERNAL=1\nTMAC_HAS_FLOAT16:INTERNAL=\n"):
+                cache.write_bytes(data)
+                with self.assertRaises(ValueError):
+                    latest.compiled_half_storage(cache)
+
     def test_neon_broadcast_changes_only_expected_half_scalar_expressions(self):
         neon = "\n".join(["((vs) * lut_s)", "((vs) * lut_s + lut_b)", "((cs) + zs * partial_sum)"] +
                          [f"vec_c{index} * vec_s)" for index in range(4)])
@@ -58,6 +70,9 @@ class LatestTest(unittest.TestCase):
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout)
                 subprocess.run([str(build / "probe")], check=True)
+                self.assertIn(latest.compiled_half_storage(build / "CMakeCache.txt"), ("_Float16", "__fp16"))
+                if fallback:
+                    self.assertEqual(latest.compiled_half_storage(build / "CMakeCache.txt"), "__fp16")
 
     def test_half_storage_adapts_each_generated_declaration(self):
         source = "typedef _Float16 half;\n// next kernel\ntypedef _Float16 half;\n"

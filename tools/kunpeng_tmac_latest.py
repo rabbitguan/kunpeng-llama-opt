@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = "c622f623fca9f0f085eb82f38874d1ab4a1791cd"
@@ -158,6 +159,14 @@ def half_storage_source(source):
         'static_assert(sizeof(half) == 2, "T-MAC requires 16-bit half storage");')
 
 
+def compiled_half_storage(cache_path):
+    key = b"TMAC_HAS_FLOAT16:INTERNAL="
+    values = [line[len(key):] for line in cache_path.read_bytes().splitlines() if line.startswith(key)]
+    if len(values) != 1 or values[0] not in (b"1", b"0", b""):
+        raise ValueError(f"Missing or invalid TMAC_HAS_FLOAT16 probe result in {cache_path}")
+    return "_Float16" if values[0] == b"1" else "__fp16"
+
+
 def neon_broadcast_source(source):
     anchor = "inline int32_t tbl_g4_int8_float_update_impl("
     if source.count(anchor) != 1:
@@ -278,8 +287,7 @@ def execute(args):
         flags += [f"-DLLAMA_SOURCE={tree}", f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *tmac_package_flags(prefix)]
         run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
         binaries[variant] = build
-    tmac_cache = (binaries["tmac"] / "CMakeCache.txt").read_text()
-    manifest["compiled_half_storage"] = "_Float16" if "TMAC_HAS_FLOAT16:INTERNAL=1" in tmac_cache else "__fp16"
+    manifest["compiled_half_storage"] = compiled_half_storage(binaries["tmac"] / "CMakeCache.txt")
     write(out / "manifest.json", manifest)
     for variant in ("tmac", "native"):
         build = binaries[variant]
@@ -349,13 +357,15 @@ def main():
         execute(args)
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError, configparser.Error) as error:
         if args.out.exists():
-            write(args.out / "failure.json", {"status": "failed", "error": str(error)})
+            write(args.out / "failure.json", {"status": "failed", "error": str(error), "traceback": traceback.format_exc()})
             manifest_path = args.out / "manifest.json"
             if manifest_path.exists():
                 manifest = json.loads(manifest_path.read_text())
                 manifest.update(status="failed", error=str(error))
                 write(manifest_path, manifest)
         print(f"Failed: {error}", file=sys.stderr)
+        location = traceback.extract_tb(error.__traceback__)[-1]
+        print(f"Failure location: {location.filename}:{location.lineno}: {location.line}", file=sys.stderr)
         build_log = args.out / "build.log"
         if isinstance(error, subprocess.CalledProcessError) and build_log.exists():
             lines = build_log.read_text(errors="replace").splitlines()
