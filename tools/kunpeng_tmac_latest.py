@@ -5,6 +5,7 @@ import array
 import configparser
 import copy
 import csv
+import difflib
 import hashlib
 import json
 import math
@@ -131,6 +132,27 @@ def tmac_package_flags(prefix):
     return [f"-DTMAC_DIR={prefix / 'lib/cmake/t-mac'}"]
 
 
+def neon_broadcast_source(source):
+    anchor = "inline int32_t tbl_g4_int8_float_update_impl("
+    if source.count(anchor) != 1:
+        raise ValueError("Expected one original T-MAC lookup microkernel")
+    start = source.index("#ifdef __ARM_NEON", source.index(anchor))
+    end = source.index("#elif defined __AVX2__", start)
+    body = source[start:end]
+    replacements = {
+        "((vs) * lut_s)": "((vs) * vdupq_n_f16(lut_s))",
+        "((vs) * lut_s + lut_b)": "((vs) * vdupq_n_f16(lut_s) + vdupq_n_f16(lut_b))",
+        "((cs) + zs * partial_sum)": "((cs) + zs * vdupq_n_f16(partial_sum))",
+    }
+    for index in range(4):
+        replacements[f"vec_c{index} * vec_s)"] = f"vec_c{index} * vdupq_n_f16(vec_s))"
+    for original, replacement in replacements.items():
+        if body.count(original) != 1:
+            raise ValueError(f"Unexpected T-MAC NEON expression: {original}")
+        body = body.replace(original, replacement)
+    return source[:start] + body + source[end:]
+
+
 def execute(args):
     frozen = json.loads((args.baseline / "manifest.json").read_text())
     profile = validate_baseline(frozen)
@@ -207,7 +229,15 @@ def execute(args):
     manifest["inireader_sha256"] = digest(header)
     write(out / "manifest.json", manifest)
     shutil.copy2(generated / "kernels.h", prefix / "include/t-mac/kernels.h")
-    shutil.copy2(generated / "kernels.cc", prefix / "lib/kernels.cc")
+    original_kernel = (generated / "kernels.cc").read_text()
+    compiled_kernel = neon_broadcast_source(original_kernel)
+    (prefix / "lib/kernels.cc").write_text(compiled_kernel)
+    (out / "neon-broadcast.patch").write_text("".join(difflib.unified_diff(
+        original_kernel.splitlines(keepends=True), compiled_kernel.splitlines(keepends=True),
+        fromfile="original/kernels.cc", tofile="compiled/kernels.cc")))
+    manifest["kernel_compatibility"] = "explicit_neon_fp16_scalar_broadcasts"
+    manifest["compiled_kernel_sha256"] = digest(prefix / "lib/kernels.cc")
+    write(out / "manifest.json", manifest)
     shutil.copy2(generated / "kcfg.ini", prefix / "lib/kcfg.ini")
     env["TMAC_KCFG_FILE"] = str(prefix / "lib/kcfg.ini")
     (prefix / "lib/cmake/t-mac/TMACConfig.cmake").write_text(
@@ -225,7 +255,8 @@ def execute(args):
         flags += [f"-DLLAMA_SOURCE={tree}", f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *tmac_package_flags(prefix)]
         run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
         binaries[variant] = build
-    for variant, build in binaries.items():
+    for variant in ("tmac", "native"):
+        build = binaries[variant]
         targets = ["llama-bench", "tmac-latest-logits"] + (["tmac-latest-check"] if variant == "tmac" else [])
         run(["cmake", "--build", build, "--target", *targets, "--parallel", args.jobs], log, env=env)
     def affinity(threads):
@@ -312,6 +343,9 @@ def main():
                 config_path = args.out / "tmac-prefix/lib/kcfg.ini"
                 if config_path.exists():
                     archive.add(config_path, arcname="kcfg.ini")
+                compatibility_patch = args.out / "neon-broadcast.patch"
+                if compatibility_patch.exists():
+                    archive.add(compatibility_patch, arcname=compatibility_patch.name)
                 archive.add(PATCH, arcname=PATCH.name)
             print(f"Logs archive: {args.out / 'logs.tar.gz'}")
     print(f"Results: {args.out}")

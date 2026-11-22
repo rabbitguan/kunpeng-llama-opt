@@ -15,6 +15,21 @@ SPEC.loader.exec_module(latest)
 
 
 class LatestTest(unittest.TestCase):
+    def test_neon_broadcast_changes_only_expected_half_scalar_expressions(self):
+        neon = "\n".join(["((vs) * lut_s)", "((vs) * lut_s + lut_b)", "((cs) + zs * partial_sum)"] +
+                         [f"vec_c{index} * vec_s)" for index in range(4)])
+        prefix = "inline int32_t tbl_g4_int8_float_update_impl(\n#ifdef __ARM_NEON\n"
+        suffix = "\n#elif defined __AVX2__\n((vs) * lut_s + lut_b)\n#endif\n"
+        source = prefix + neon + suffix
+        result = latest.neon_broadcast_source(source)
+        self.assertTrue(result.startswith(prefix))
+        self.assertTrue(result.endswith(suffix))
+        self.assertEqual(result.count("vdupq_n_f16("), 8)
+        with self.assertRaisesRegex(ValueError, "Unexpected T-MAC NEON expression"):
+            latest.neon_broadcast_source(source.replace("vec_c3 * vec_s)", "changed"))
+        with self.assertRaisesRegex(ValueError, "Expected one"):
+            latest.neon_broadcast_source(source + source)
+
     @unittest.skipUnless(shutil.which("cmake"), "cmake is unavailable")
     def test_cmake_finds_tmac_in_hyphenated_package_directory(self):
         with tempfile.TemporaryDirectory() as directory:
