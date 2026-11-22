@@ -127,6 +127,10 @@ def execution_profile(saved, allow_host_change):
     return profile
 
 
+def tmac_package_flags(prefix):
+    return [f"-DTMAC_DIR={prefix / 'lib/cmake/t-mac'}"]
+
+
 def execute(args):
     frozen = json.loads((args.baseline / "manifest.json").read_text())
     profile = validate_baseline(frozen)
@@ -218,11 +222,12 @@ def execute(args):
                  "-DGGML_CCACHE=OFF", "-DGGML_OPENMP=ON", "-DGGML_CPU_REPACK=ON", "-DGGML_BLAS=OFF", "-DGGML_CPU_KLEIDIAI=OFF", "-DLLAMA_CURL=OFF"]
         flags += [f"-D{key}={profile['toolchain'][key]}" for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")]
         flags += ["-DGGML_NATIVE=OFF", f"-DGGML_CPU_ARM_ARCH={profile['arm_arch']}"] if profile.get("arm_arch") else ["-DGGML_NATIVE=ON"]
-        flags += [f"-DLLAMA_SOURCE={tree}", f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", f"-DCMAKE_PREFIX_PATH={prefix}"]
+        flags += [f"-DLLAMA_SOURCE={tree}", f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *tmac_package_flags(prefix)]
         run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
+        binaries[variant] = build
+    for variant, build in binaries.items():
         targets = ["llama-bench", "tmac-latest-logits"] + (["tmac-latest-check"] if variant == "tmac" else [])
         run(["cmake", "--build", build, "--target", *targets, "--parallel", args.jobs], log, env=env)
-        binaries[variant] = build
     def affinity(threads):
         return ["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"][:threads])), f"--membind={profile['node']}"]
     run([*affinity(32), binaries["tmac"] / "tmac-latest-check"], out / "operator.log", env=env, output=out / "operator.jsonl")

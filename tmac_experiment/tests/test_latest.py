@@ -2,6 +2,8 @@ import array
 import importlib.util
 from pathlib import Path
 import struct
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -13,6 +15,22 @@ SPEC.loader.exec_module(latest)
 
 
 class LatestTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("cmake"), "cmake is unavailable")
+    def test_cmake_finds_tmac_in_hyphenated_package_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "prefix/lib/cmake/t-mac"
+            package.mkdir(parents=True)
+            (package / "TMACConfig.cmake").write_text("add_library(t_mac_no_tvm INTERFACE)\n")
+            source = root / "source"
+            source.mkdir()
+            (source / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.22)\nproject(check NONE)\nfind_package(TMAC REQUIRED CONFIG)\n"
+                'if(NOT TARGET t_mac_no_tvm)\nmessage(FATAL_ERROR "Missing T-MAC target")\nendif()\n')
+            subprocess.run(["cmake", "-S", str(source), "-B", str(root / "build"),
+                            *latest.tmac_package_flags(root / "prefix")],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
+
     def test_host_change_requires_explicit_option(self):
         profile = {"hostname": "cnkunpengb01", "node": 0, "cpus": list(range(0, 64, 2))}
         with mock.patch.object(latest.platform, "node", return_value="cnkunpengb08"):
