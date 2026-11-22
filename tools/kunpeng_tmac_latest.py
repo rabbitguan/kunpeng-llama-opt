@@ -3,6 +3,7 @@
 import argparse
 import array
 import configparser
+import copy
 import csv
 import hashlib
 import json
@@ -101,15 +102,40 @@ def validate_baseline(frozen):
     return profile
 
 
+def execution_profile(saved, allow_host_change):
+    profile = copy.deepcopy(saved)
+    hostname = platform.node()
+    if saved["hostname"] != hostname:
+        if not allow_host_change:
+            raise ValueError(f"Baseline host is {saved['hostname']}; current host is {hostname}. Use --allow-host-change to remeasure both variants here")
+        allowed = os.sched_getaffinity(0)
+        topology = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET,NODE"], text=True)
+        physical = {}
+        for line in topology.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            cpu, core, socket, node = line.split(",")
+            if node == str(saved["node"]) and core != "-" and socket != "-" and int(cpu) in allowed:
+                key = (socket, core)
+                physical[key] = min(physical.get(key, int(cpu)), int(cpu))
+        cpus = sorted(physical.values())
+        if len(cpus) < 32:
+            raise ValueError(f"Current NUMA node {saved['node']} has only {len(cpus)} allowed physical cores; 32 required")
+        profile.update(hostname=hostname, cpus=cpus[:32])
+    if len(profile["cpus"]) != 32 or not set(profile["cpus"]).issubset(os.sched_getaffinity(0)):
+        raise ValueError("Saved physical CPU binding is unavailable")
+    return profile
+
+
 def execute(args):
     frozen = json.loads((args.baseline / "manifest.json").read_text())
     profile = validate_baseline(frozen)
     if platform.system() != "Linux" or platform.machine() != "aarch64":
         raise ValueError("Run on the Linux AArch64 baseline server")
-    if profile["hostname"] != platform.node():
-        raise ValueError("Baseline hostname differs")
-    if len(profile["cpus"]) != 32 or not set(profile["cpus"]).issubset(os.sched_getaffinity(0)):
-        raise ValueError("Saved physical CPU binding is unavailable")
+    profile = execution_profile(profile, args.allow_host_change)
+    if profile["hostname"] != frozen["profile"]["hostname"]:
+        print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. Both variants will be remeasured; historical throughput is not used.", flush=True)
+        print(f"NUMA node {profile['node']}, current physical CPUs: {profile['cpus']}", flush=True)
     model = Path(profile["model"])
     if digest(model) != profile["model_sha256"]:
         raise ValueError("Model checksum differs")
@@ -145,12 +171,16 @@ def execute(args):
     env["GIT_CEILING_DIRECTORIES"] = str(out)
     log = out / "build.log"
     manifest = {"status": "preparing", "commit": PIN, "baseline": str(args.baseline), "profile": profile,
+                "baseline_profile": frozen["profile"], "host_changed": profile["hostname"] != frozen["profile"]["hostname"],
+                "historical_throughput_used": False,
                 "tmac_baseline": str(args.tmac_baseline), "kernel_N": 1, "tuning": False,
                 "patch_sha256": digest(PATCH), "generated_sha256": historical["generated_sha256"],
                 "limitations": ["N=1 generated kernels also process prefill", "raw and packed weights both resident", "fixed-token smoke is not perplexity evaluation"]}
     selector_patch = args.baseline / "q4-4x4.patch" if frozen.get("upstream_selector_modified") else None
     manifest["baseline_selector_patch_sha256"] = digest(selector_patch) if selector_patch else None
     write(out / "manifest.json", manifest)
+    run(["lscpu"], out / "cpu-topology.log", env=env)
+    run(["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"])), f"--membind={profile['node']}", "true"], log, env=env)
     source = Path(frozen["source"])
     archive = out / "source.tar"
     run(["git", "-C", source, "archive", "--format=tar", "--output", archive, PIN], log)
@@ -248,6 +278,7 @@ def main():
     parser.add_argument("--tmac-baseline", required=True, type=Path, help="successful original basic_baseline directory")
     parser.add_argument("--out", required=True, type=Path, help="new result directory")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--allow-host-change", action="store_true", help="remeasure both variants on this host using 32 allowed physical cores from the saved NUMA node")
     args = parser.parse_args()
     args.baseline, args.tmac_baseline, args.out = (path.resolve() for path in (args.baseline, args.tmac_baseline, args.out))
     if args.out.exists() or args.jobs < 1:
