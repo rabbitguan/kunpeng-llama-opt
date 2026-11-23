@@ -4,10 +4,14 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <random>
+#include <memory>
 #include <vector>
 
 static void require(bool ok, const char * message) {
@@ -16,8 +20,17 @@ static void require(bool ok, const char * message) {
     }
 }
 
-int main() {
+int main(int argc, char ** argv) {
     try {
+        const bool benchmark = argc >= 2 && (!strcmp(argv[1], "--bench-tmac") || !strcmp(argv[1], "--bench-native"));
+        require(argc == 1 || (benchmark && argc <= 3), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32]]");
+        int selected_threads = 0;
+        if (argc == 3) {
+            require(!strcmp(argv[2], "1") || !strcmp(argv[2], "16") || !strcmp(argv[2], "32"), "invalid thread count");
+            selected_threads = std::atoi(argv[2]);
+        }
+        const bool native = benchmark && !strcmp(argv[1], "--bench-native");
+        const char * buffer_name = native ? "CPU_REPACK" : "CPU_TMAC";
         ggml_backend_t cpu = ggml_backend_cpu_init();
         using extra_fn = ggml_backend_buffer_type_t * (*)(ggml_backend_dev_t);
         auto extra = reinterpret_cast<extra_fn>(ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(), "ggml_backend_dev_get_extra_bufts"));
@@ -25,11 +38,11 @@ int main() {
         auto dev = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
         ggml_backend_buffer_type_t buft = nullptr;
         for (auto * current = extra(dev); *current; ++current) {
-            if (!strcmp(ggml_backend_buft_name(*current), "CPU_TMAC")) {
+            if (!strcmp(ggml_backend_buft_name(*current), buffer_name)) {
                 buft = *current;
             }
         }
-        require(buft != nullptr, "CPU_TMAC is unavailable");
+        require(buft != nullptr, "requested CPU buffer is unavailable");
         constexpr int k = 4096, m = 4096;
         auto * wc = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
         require(wc != nullptr, "weight context failed");
@@ -47,9 +60,11 @@ int main() {
             }
         }
         ggml_backend_tensor_set(w, raw.data(), 0, raw.size());
-        std::vector<uint8_t> readback(raw.size());
-        ggml_backend_tensor_get(w, readback.data(), 0, readback.size());
-        require(readback == raw, "raw weight readback changed");
+        if (!native) {
+            std::vector<uint8_t> readback(raw.size());
+            ggml_backend_tensor_get(w, readback.data(), 0, readback.size());
+            require(readback == raw, "raw weight readback changed");
+        }
         for (int rows : {1, 7, 32}) {
             auto * ctx = ggml_init({ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true});
             require(ctx != nullptr, "graph context failed");
@@ -80,6 +95,11 @@ int main() {
             ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
             std::vector<float> single, result(expected.size());
             for (int threads : {1, 16, 32}) {
+                if (selected_threads && threads != selected_threads) continue;
+                auto pool_params = ggml_threadpool_params_default(threads);
+                std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&pool_params), ggml_threadpool_free);
+                require(bool(pool), "threadpool creation failed");
+                ggml_backend_cpu_set_threadpool(cpu, pool.get());
                 ggml_backend_cpu_set_n_threads(cpu, threads);
                 require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "graph compute failed");
                 ggml_backend_tensor_get(y, result.data(), 0, result.size() * sizeof(float));
@@ -97,7 +117,25 @@ int main() {
                 } else {
                     require(memcmp(single.data(), result.data(), result.size() * sizeof(float)) == 0, "thread counts changed outputs");
                 }
-                std::printf("{\"rows\":%d,\"threads\":%d,\"nmse\":%.9g,\"max_abs\":%.9g,\"status\":\"pass\"}\n", rows, threads, error / norm, max_abs);
+                if (benchmark) {
+                    std::vector<double> samples;
+                    for (int round = -3; round < 10; ++round) {
+                        const auto start = std::chrono::steady_clock::now();
+                        require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "timed compute failed");
+                        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                        if (round >= 0) samples.push_back(us);
+                    }
+                    auto ordered = samples;
+                    std::sort(ordered.begin(), ordered.end());
+                    std::printf("{\"buffer\":\"%s\",\"K\":%d,\"M\":%d,\"rows\":%d,\"threads\":%d,\"nmse\":%.9g,\"max_abs\":%.9g,\"median_graph_us\":%.6f,\"samples_us\":[",
+                                buffer_name, k, m, rows, threads, error / norm, max_abs, (ordered[4] + ordered[5]) / 2);
+                    for (size_t i = 0; i < samples.size(); ++i) std::printf("%s%.6f", i ? "," : "", samples[i]);
+                    std::printf("],\"status\":\"pass\"}\n");
+                } else {
+                    std::printf("{\"rows\":%d,\"threads\":%d,\"nmse\":%.9g,\"max_abs\":%.9g,\"status\":\"pass\"}\n", rows, threads, error / norm, max_abs);
+                }
+                std::fflush(stdout);
+                ggml_backend_cpu_set_threadpool(cpu, nullptr);
             }
             ggml_backend_buffer_free(buffer);
             ggml_free(ctx);

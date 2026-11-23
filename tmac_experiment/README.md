@@ -1,5 +1,11 @@
 # Kunpeng T-MAC baseline experiment
 
+## Short operator diagnosis after a completed run
+
+Run `python3 tools/kunpeng_tmac_diagnose.py --run /absolute/path/to/completed/tmac_latest_RUN --out /absolute/path/to/new-diagnostics`. This reuses the completed run's frozen native and T-MAC source trees and generated kernels, but creates separate builds and results. It builds only the GGML operator check target and loads no model. Saved compiler, ISA, CPU binding and NUMA settings are reused. CPU/cache/NUMA information and compiler paths from the historical T-MAC build caches are collected automatically; perf is not required. Return the generated `diagnostics.tar.gz`.
+
+The probe compares CPU_REPACK and CPU_TMAC on identical deterministic synthetic Q4_0 weights of shape 4096x4096, with 1/7/32 activation rows and 1/16/32 threads. Independent mathematical correctness checks remain active. Each thread count uses its corresponding saved CPU binding and a reusable GGML threadpool, excluding thread creation from timing. Three warmups precede ten recorded samples. Graph timing includes activation preparation, computation, output conversion, synchronization and graph dispatch/planning, but excludes weight packing and correctness checks. This first diagnostic does not split those stages. A repeatedly used matrix has different cache behavior from full-model inference, so its speedup is diagnostic evidence, not a model-level performance claim. The summary uses native duration divided by T-MAC duration, so values below one mean T-MAC is slower. Existing completed artifacts are not modified.
+
 ## Original T-MAC on the c622f62 baseline
 
 Run `python3 tools/kunpeng_tmac_latest.py --baseline /absolute/path/to/official-Q4-baseline --tmac-baseline /absolute/path/to/basic_baseline_RUN --out /absolute/path/to/new-results`. The official baseline must be a completed generation run from `bench-llama-baseline.py` at `c622f623fca9f0f085eb82f38874d1ab4a1791cd`, containing threads 1,16,32 and pp512, pp2048, tg128, tg128_d1024. Both the auto selector and its recorded official 4x4 selector patch are supported. The old T-MAC directory must be the successful original untuned baseline for the same Q4_0 GGUF. No server dependencies are downloaded or regenerated.

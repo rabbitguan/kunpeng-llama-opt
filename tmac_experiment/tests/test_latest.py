@@ -5,6 +5,7 @@ import struct
 import shutil
 import subprocess
 import platform
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -13,9 +14,24 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("tmac_latest", ROOT / "tools/kunpeng_tmac_latest.py")
 latest = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(latest)
+with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
+    DIAG_SPEC = importlib.util.spec_from_file_location("tmac_diagnose", ROOT / "tools/kunpeng_tmac_diagnose.py")
+    diagnose = importlib.util.module_from_spec(DIAG_SPEC)
+    DIAG_SPEC.loader.exec_module(diagnose)
 
 
 class LatestTest(unittest.TestCase):
+    def test_diagnostic_ratio_uses_durations_in_the_correct_direction(self):
+        rows = [{"variant": variant, "rows": count, "threads": threads, "median_graph_us": value}
+                for threads in (1, 16, 32) for count in (1, 7, 32)
+                for variant, value in (("native", 10.0), ("tmac", 20.0))]
+        result = diagnose.compare_rows(rows)
+        self.assertEqual(len(result), 9)
+        self.assertTrue(all(row["native_us_over_tmac_us"] == 0.5 for row in result))
+        rows[0]["median_graph_us"] = float("nan")
+        with self.assertRaises(ValueError):
+            diagnose.compare_rows(rows)
+
     def test_half_probe_reads_ascii_entry_from_non_utf8_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "CMakeCache.txt"
