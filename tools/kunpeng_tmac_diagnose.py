@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -113,6 +114,56 @@ def blocked_backend_source(source, block_rows):
     return source[:start] + replacement + source[end:]
 
 
+def profiled_backend_source(source):
+    changes = [
+        ("#include <atomic>\n", "#include <atomic>\n#include <chrono>\n#include <cstdio>\n"),
+        ("        for (int row = params->ith; row < rows; row += params->nth) {\n",
+         "        using profile_clock = std::chrono::steady_clock;\n"
+         "        const auto prepare_begin = profile_clock::now();\n"
+         "        for (int row = params->ith; row < rows; row += params->nth) {\n"),
+        ("        ggml_barrier(params->threadpool);\n",
+         "        const auto prepare_end = profile_clock::now();\n"
+         "        ggml_barrier(params->threadpool);\n"
+         "        const auto consume_begin = profile_clock::now();\n"),
+        ("        if (params->ith == 0) {\n",
+         "        const auto consume_end = profile_clock::now();\n"
+         "        ggml_barrier(params->threadpool);\n"
+         "        const double prepare_us = std::chrono::duration<double, std::micro>(prepare_end - prepare_begin).count();\n"
+         "        const double wait_us = std::chrono::duration<double, std::micro>(consume_begin - prepare_end).count();\n"
+         "        const double consume_us = std::chrono::duration<double, std::micro>(consume_end - consume_begin).count();\n"
+         '        std::fprintf(stderr, "tmac: stage {\\"K\\":%d,\\"M\\":%d,\\"rows\\":%d,\\"threads\\":%d,\\"ith\\":%d,\\"prepare_us\\":%.6f,\\"wait_us\\":%.6f,\\"consume_us\\":%.6f}\\n",\n'
+         "                     k, m, rows, params->nth, params->ith, prepare_us, wait_us, consume_us);\n"
+         "        if (params->ith == 0) {\n"),
+    ]
+    for old, new in changes:
+        if source.count(old) != 1:
+            raise ValueError("Unrecognized T-MAC profiling anchor")
+        source = source.replace(old, new, 1)
+    return source
+
+
+def read_stage_profile(log, threads):
+    records = [json.loads(line[len("tmac: stage "):]) for line in log.read_text().splitlines() if line.startswith("tmac: stage ")]
+    result = []
+    for count in (1, 7, 32):
+        selected = [row for row in records if row["threads"] == threads and row["rows"] == count]
+        if len(selected) != threads * 14:
+            raise ValueError("Expected one correctness compute, three warmups and ten stage samples")
+        samples: list[dict] = []
+        for first in range(0, len(selected), threads):
+            workers = sorted(selected[first:first + threads], key=lambda row: row["ith"])
+            if [row["ith"] for row in workers] != list(range(threads)):
+                raise ValueError("Incomplete profiling worker group")
+            for row in workers:
+                if (row["K"], row["M"]) != (4096, 4096) or any(not math.isfinite(row[key]) or row[key] < 0 for key in ("prepare_us", "wait_us", "consume_us")):
+                    raise ValueError("Invalid worker stage duration")
+            samples.append({"workers": workers, **{"max_" + key: max(row[key] for row in workers) for key in ("prepare_us", "wait_us", "consume_us")}})
+        samples = samples[4:]
+        result.append({"rows": count, "threads": threads, "samples": samples,
+                       **{"median_max_" + key: statistics.median(row["max_" + key] for row in samples) for key in ("prepare_us", "wait_us", "consume_us")}})
+    return result
+
+
 def execute(args):
     frozen = json.loads((args.run / "manifest.json").read_text())
     if frozen.get("status") != "smoke_and_benchmark_pass" or frozen.get("commit") != latest.PIN:
@@ -161,7 +212,12 @@ def execute(args):
         shutil.copy2(args.run / name, args.out / ("completed-" + name))
     rows = []
     block_rows = getattr(args, "row_block", None)
-    variants = ("native", "tmac", "blocked") if block_rows is not None else ("native", "tmac")
+    profile_stages = getattr(args, "profile_stages", False)
+    if block_rows is not None and profile_stages:
+        raise ValueError("Choose either row blocking or stage profiling")
+    candidate = "blocked" if block_rows is not None else "profiled" if profile_stages else None
+    variants = ("native", "tmac", candidate) if candidate is not None else ("native", "tmac")
+    stages = []
     for variant in variants:
         backend = "native" if variant == "native" else "tmac"
         build = args.out / (backend + "-build")
@@ -170,14 +226,14 @@ def execute(args):
                  "-DGGML_CCACHE=OFF", "-DGGML_OPENMP=ON", "-DGGML_CPU_REPACK=ON", "-DGGML_BLAS=OFF",
                  "-DGGML_CPU_KLEIDIAI=OFF", "-DLLAMA_CURL=OFF", f"-DLLAMA_SOURCE={source}",
                  f"-DGGML_TMAC={'ON' if backend == 'tmac' else 'OFF'}", *latest.tmac_package_flags(prefix)]
-        if variant == "blocked":
+        if variant == candidate:
             original = (source / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_text()
-            modified = blocked_backend_source(original, block_rows)
-            override = args.out / "blocked-backend.cpp"
+            modified = blocked_backend_source(original, block_rows) if variant == "blocked" else profiled_backend_source(original)
+            override = args.out / f"{candidate}-backend.cpp"
             override.write_text(modified)
-            (args.out / "blocked-backend.patch").write_text("".join(difflib.unified_diff(
+            (args.out / f"{candidate}-backend.patch").write_text("".join(difflib.unified_diff(
                 original.splitlines(keepends=True), modified.splitlines(keepends=True),
-                fromfile="original/tmac.cpp", tofile="blocked/tmac.cpp")))
+                fromfile="original/tmac.cpp", tofile=f"{candidate}/tmac.cpp")))
             flags.append(f"-DTMAC_DIAGNOSTIC_BACKEND_SOURCE={override}")
         flags += [f"-D{key}={profile['toolchain'][key]}" for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")]
         if clang_root is not None:
@@ -187,7 +243,7 @@ def execute(args):
         print(f"Building the {variant} operator probe; log: {log}", flush=True)
         latest.run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
         latest.run(["cmake", "--build", build, "--target", "tmac-latest-check", "--parallel", str(args.jobs)], log, env=env)
-        if block_rows is not None and variant == "tmac":
+        if candidate is not None and variant == "tmac":
             shutil.copy2(build / "compile_commands.json", args.out / "original-tmac-compile_commands.json")
             shutil.copy2(build / "CMakeCache.txt", args.out / "original-tmac-CMakeCache.txt")
         for threads in (1, 16, 32):
@@ -196,7 +252,7 @@ def execute(args):
             env["OMP_NUM_THREADS"] = str(threads)
             command = ["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"][:threads])),
                        f"--membind={profile['node']}", str(build / "tmac-latest-check"), "--bench-" + backend, str(threads)]
-            if block_rows is not None and backend == "tmac":
+            if candidate is not None and backend == "tmac":
                 data = args.out / (name + ".bin")
                 command.append(str(data))
             print(f"Checking and timing {name}", flush=True)
@@ -215,16 +271,22 @@ def execute(args):
                 rows.append(row)
             if backend == "tmac":
                 latest.dispatch(args.out / (name + ".log"), threads)
-            if variant == "blocked":
+            if variant == candidate:
                 expected = args.out / f"tmac-t{threads}.bin"
                 if data.stat().st_size != 4096 * (1 + 7 + 32) * 4 or data.read_bytes() != expected.read_bytes():
-                    raise ValueError("Blocked scheduling changed output bytes")
+                    raise ValueError("Diagnostic backend changed output bytes")
+            if variant == "profiled":
+                stages.extend(read_stage_profile(args.out / (name + ".log"), threads))
         objdump = shutil.which("objdump")
         if objdump and variant == "tmac":
             for index, obj in enumerate(build.rglob("kernels.cc.o")):
                 with (args.out / f"kernels-{index}.asm").open("wb") as output:
                     subprocess.run([objdump, "-d", "-C", str(obj)], stdout=output, stderr=subprocess.STDOUT, check=True)
     latest.write(args.out / "operator-comparison.json", compare_rows(rows))
+    if profile_stages:
+        latest.write(args.out / "stage-profile.json", {"records": stages,
+                     "scope": "instrumented original T-MAC, input conversion/LUT preparation, LUT barrier wait, qgemm/output conversion",
+                     "limitations": ["stage maxima can come from different workers and must not be added as a total", "instrumented graph timing includes an added end barrier and logging; use uninstrumented controls for performance comparisons", "ten samples after one correctness compute and three warmups"]})
     if block_rows is not None:
         indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
         comparisons = []
@@ -242,6 +304,8 @@ def execute(args):
                  "toolchain_override": str(clang_root) if clang_root is not None else None,
                  "experimental_row_block": block_rows, "blocked_outputs_bitwise_equal": True if block_rows is not None else None,
                  "blocked_backend_sha256": latest.digest(args.out / "blocked-backend.cpp") if block_rows is not None else None,
+                 "stage_profiling": profile_stages, "profiled_outputs_bitwise_equal": True if profile_stages else None,
+                 "profiled_backend_sha256": latest.digest(args.out / "profiled-backend.cpp") if profile_stages else None,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "scope": "synthetic 4096x4096 Q4_0, repeated matrix, reusable GGML threadpool, three warmups and ten samples",
                  "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "toolchain changes can also change the OpenMP runtime; inspect build caches", "no model performance claim"]})
@@ -257,6 +321,7 @@ def main():
     parser.add_argument("--allow-host-change", action="store_true", help="remeasure both operators on this host using current physical cores from the saved NUMA node")
     parser.add_argument("--clang-root", type=Path, help="optional LLVM prefix; build both native and T-MAC with its clang/clang++")
     parser.add_argument("--row-block", type=int, choices=(1, 4, 8, 16, 32), help="also test experimental weight-tile-first scheduling with this row block")
+    parser.add_argument("--profile-stages", action="store_true", help="also measure per-worker preparation, LUT barrier wait and consumption in an instrumented original T-MAC copy")
     args = parser.parse_args()
     if args.inspect_host:
         try:
@@ -269,6 +334,8 @@ def main():
         parser.error("--run and --out are required for an experiment")
     if args.numa_node is not None and args.numa_node < 0:
         parser.error("--numa-node must be nonnegative")
+    if args.profile_stages and args.row_block is not None:
+        parser.error("Choose either --row-block or --profile-stages")
     args.run, args.out = args.run.resolve(), args.out.resolve()
     if args.clang_root is not None:
         args.clang_root = args.clang_root.resolve()

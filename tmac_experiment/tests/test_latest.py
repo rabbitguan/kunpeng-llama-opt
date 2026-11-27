@@ -26,6 +26,58 @@ with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
 
 
 class LatestTest(unittest.TestCase):
+    def test_stage_profile_requires_complete_worker_groups_and_skips_warmups(self):
+        records = []
+        for count in (1, 7, 32):
+            for round in range(14):
+                for worker in (1, 0):
+                    records.append({"K": 4096, "M": 4096, "rows": count, "threads": 2, "ith": worker,
+                                    "prepare_us": round + worker, "wait_us": 0.0, "consume_us": 10.0 + round})
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "profile.log"
+            def write_records():
+                log.write_text("\n".join("tmac: stage " + json.dumps(row) for row in records))
+            write_records()
+            result = diagnose.read_stage_profile(log, 2)
+            self.assertEqual(len(result), 3)
+            for row in result:
+                self.assertEqual(len(row["samples"]), 10)
+                self.assertEqual(row["median_max_prepare_us"], 9.5)
+                self.assertEqual(row["samples"][0]["max_prepare_us"], 5)
+            records[0]["ith"] = 0
+            write_records()
+            with self.assertRaisesRegex(ValueError, "worker group"):
+                diagnose.read_stage_profile(log, 2)
+            records[0]["ith"] = 1
+            records[-1]["consume_us"] = float("nan")
+            write_records()
+            with self.assertRaisesRegex(ValueError, "stage duration"):
+                diagnose.read_stage_profile(log, 2)
+            records.pop()
+            write_records()
+            with self.assertRaisesRegex(ValueError, "ten stage samples"):
+                diagnose.read_stage_profile(log, 2)
+
+    @unittest.skipUnless(os.environ.get("TMAC_LATEST_CHECK") and os.environ.get("TMAC_PROFILED_CHECK"), "set both compiled ARM64 probes")
+    def test_profiled_operator_keeps_outputs_and_reports_each_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for threads in (1, 16, 32):
+                outputs = []
+                for name in ("TMAC_LATEST_CHECK", "TMAC_PROFILED_CHECK"):
+                    path = root / f"{name}-{threads}.bin"
+                    result = subprocess.run([os.environ[name], "--bench-tmac", str(threads), str(path)],
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    outputs.append(path.read_bytes())
+                    if name == "TMAC_PROFILED_CHECK":
+                        log = root / f"profile-t{threads}.log"
+                        log.write_text(result.stderr)
+                        stages = diagnose.read_stage_profile(log, threads)
+                        self.assertEqual(len(stages), 3)
+                self.assertEqual(len(outputs[0]), 4096 * 40 * 4)
+                self.assertEqual(outputs[0], outputs[1])
+
     def test_host_inspection_counts_busy_smt_siblings(self):
         topology = "\n".join(f"{cpu},{cpu % 8},0,{(cpu % 8) // 2}" for cpu in (0, 1, 2, 3, 8, 9, 10, 11))
         before, after = [], []
@@ -150,6 +202,14 @@ class LatestTest(unittest.TestCase):
                             "median_graph_us": 10.0} for count in (1, 7, 32)]
                 output.write_text("\n".join(json.dumps(row) for row in records))
                 log.write_text(f"tmac: packed tensor=w\ntmac: compute tensor=w threads={threads} kernel_N=1\n")
+                if output.name.startswith("profiled-"):
+                    with log.open("a") as stream:
+                        for count in (1, 7, 32):
+                            for round in range(14):
+                                for worker in range(threads):
+                                    row = {"K": 4096, "M": 4096, "rows": count, "threads": threads, "ith": worker,
+                                           "prepare_us": 1.0, "wait_us": 2.0, "consume_us": 3.0}
+                                    stream.write("tmac: stage " + json.dumps(row) + "\n")
 
             topology = "\n".join(f"{cpu},{cpu // 2},0,{0 if cpu < 128 else 1}" for cpu in range(64, 192))
             args = argparse.Namespace(run=run, out=root / "diagnosis", jobs=4, allow_host_change=False)
@@ -171,6 +231,17 @@ class LatestTest(unittest.TestCase):
                 args.numa_node = 1
                 args.out = root / "blocked"
                 diagnose.execute(args)
+                args.row_block = None
+                args.profile_stages = True
+                args.out = root / "profiled"
+                diagnose.execute(args)
+            profiled = json.loads((args.out / "diagnosis.json").read_text())
+            self.assertTrue(profiled["profiled_outputs_bitwise_equal"])
+            self.assertTrue(profiled["stage_profiling"])
+            stages = json.loads((args.out / "stage-profile.json").read_text())
+            self.assertEqual(len(stages["records"]), 9)
+            self.assertTrue(all(row["median_max_consume_us"] == 3 for row in stages["records"]))
+            args.out = root / "blocked"
             blocked = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(blocked["blocked_outputs_bitwise_equal"])
             self.assertEqual(blocked["experimental_row_block"], 8)
@@ -191,7 +262,7 @@ class LatestTest(unittest.TestCase):
             self.assertEqual(metadata["execution_profile"]["hostname"], "cnkunpengb04")
             self.assertEqual(metadata["execution_profile"]["cpus"], list(range(64, 128, 2)))
             measurements = [command for command in commands if command[0] == "numactl"]
-            self.assertEqual(len(measurements), 15)
+            self.assertEqual(len(measurements), 24)
             for position, command in enumerate(measurements):
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
                 first = 64 if position < 6 else 128
