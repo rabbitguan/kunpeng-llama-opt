@@ -2,6 +2,7 @@
 
 #include <arm_neon.h>
 #include <cstdint>
+#include <cstring>
 
 extern "C" {
 int32_t partial_max_reset(void * scales);
@@ -25,6 +26,18 @@ struct row {
     const float16_t * biases;
     float * output;
 };
+
+inline void pack(int k, const uint8_t * weights, const float16_t * scales, uint8_t * packed, float16_t * packed_scales) {
+    const int groups = k / 32;
+    for (int block = 0; block < 8; ++block) {
+        for (int group = 0; group < groups; ++group) {
+            const size_t from = size_t(group) * 8 + block;
+            const size_t to = size_t(block) * groups + group;
+            std::memcpy(packed + to * 128, weights + from * 128, 128);
+            std::memcpy(packed_scales + to * 8, scales + from * 8, 8 * sizeof(float16_t));
+        }
+    }
+}
 
 inline void prepare(int groups, float16_t * input, int8_t * lut, float16_t * scales, float16_t * biases) {
     for (int group = 0; group < groups; ++group) {
@@ -63,7 +76,7 @@ inline void fused(int k, const uint8_t * weights, const float16_t * scales, cons
 #pragma GCC unroll 8
 #endif
             for (int j = 0; j < 8; ++j) {
-                const uint8x16_t packed = vld1q_u8(weights + group * 1024 + block * 128 + j * 16);
+                const uint8x16_t packed = vld1q_u8(weights + (size_t(block) * (k / 32) + group) * 128 + j * 16);
                 const uint8x16_t low = vandq_u8(packed, mask);
                 const uint8x16_t high = vshrq_n_u8(packed, 4);
                 GGML_TMAC_UNROLL_ROWS
@@ -77,7 +90,7 @@ inline void fused(int k, const uint8_t * weights, const float16_t * scales, cons
                     sums[r][3] = vaddw_s8(sums[r][3], vget_high_s8(top));
                 }
             }
-            const float16x8_t scale = vld1q_f16(scales + group * 64 + block * 8);
+            const float16x8_t scale = vld1q_f16(scales + (size_t(block) * (k / 32) + group) * 8);
             GGML_TMAC_UNROLL_ROWS
             for (int r = 0; r < Rows; ++r) {
                 const float16x8_t lut_scale = vdupq_n_f16(input[r].scales[group]);

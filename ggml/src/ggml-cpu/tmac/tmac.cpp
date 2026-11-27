@@ -27,6 +27,15 @@ static size_t aligned(size_t n) {
     return (n + 63) & ~size_t(63);
 }
 
+static bool use_fused(const config & c) {
+#if defined(GGML_TMAC_FUSED)
+    return c.bm == 256 && c.simd_n_in == 16 && c.simd_n_out == 8 && c.kfactor == 8;
+#else
+    (void) c;
+    return false;
+#endif
+}
+
 static config kernel_config(const ggml_tensor * t) {
     if (t->type != GGML_TYPE_Q4_0 || t->view_src || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1 ||
         t->ne[0] < 32 || t->ne[0] > 65536 || t->ne[0] % 32 || t->ne[1] < 1 || t->ne[1] > 65536 ||
@@ -66,7 +75,7 @@ static config kernel_config(const ggml_tensor * t) {
     return c;
 }
 
-// Same permutations as the pinned ggml-tmac.cpp Q4_0 transformer, without expanded bit buffers.
+// The base layout follows the pinned ggml-tmac.cpp Q4_0 transformer.
 static void pack(const ggml_tensor * t, const config & c, uint8_t * weights, half * scales) {
     const size_t k = t->ne[0], m = t->ne[1], kg = k / 4;
     const size_t bm = c.bm, si = c.simd_n_in, so = c.simd_n_out, kf = c.kfactor;
@@ -100,6 +109,20 @@ static void pack(const ggml_tensor * t, const config & c, uint8_t * weights, hal
             memcpy(scales + index, &scale, sizeof(scale));
         }
     }
+#if defined(GGML_TMAC_FUSED)
+    if (use_fused(c)) {
+        const size_t weight_stride = size_t(k) * 32, scale_stride = size_t(k) * 2;
+        std::vector<uint8_t> original_weights(weight_stride);
+        std::vector<float16_t> original_scales(scale_stride);
+        for (int tile = 0; tile < c.n_tile_num; ++tile) {
+            auto * w = weights + size_t(tile) * weight_stride;
+            auto * s = reinterpret_cast<float16_t *>(scales) + size_t(tile) * scale_stride;
+            memcpy(original_weights.data(), w, weight_stride);
+            memcpy(original_scales.data(), s, scale_stride * sizeof(float16_t));
+            ggml_tmac::pack(int(k), original_weights.data(), original_scales.data(), w, s);
+        }
+    }
+#endif
 }
 
 class tensor_traits final : public ggml::cpu::tensor_traits {
@@ -153,9 +176,8 @@ public:
         auto * local = workspace + size_t(rows) * rw + size_t(params->ith) * tw;
         auto * input = reinterpret_cast<half *>(local);
         auto * output = reinterpret_cast<half *>(local + aligned(size_t(k) * sizeof(half)));
-        bool fused = false;
+        const bool fused = use_fused(c);
 #if defined(GGML_TMAC_FUSED)
-        fused = c.bm == 256 && c.simd_n_in == 16 && c.simd_n_out == 8 && c.kfactor == 8;
         if (fused) {
             const int groups = k / 32, chunks = (groups + 31) / 32;
             for (int64_t task = params->ith; task < int64_t(rows) * chunks; task += params->nth) {

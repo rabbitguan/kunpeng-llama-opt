@@ -41,7 +41,29 @@ static void check(int k, int mode, std::mt19937 & random) {
             throw std::runtime_error("chunked LUT preparation differs from original");
         }
     }
-    ggml_tmac::fused(k, weights.data(), scales.data(), input);
+    std::vector<uint8_t> packed(weights.size() + 128, 193);
+    std::vector<float16_t> packed_scales(scales.size() + 16, 91);
+    ggml_tmac::pack(k, weights.data(), scales.data(), packed.data() + 64, packed_scales.data() + 8);
+    for (int block = 0; block < 8; ++block) {
+        for (int group = 0; group < groups; ++group) {
+            const size_t from = size_t(group) * 8 + block, to = size_t(block) * groups + group;
+            if (std::memcmp(packed.data() + 64 + to * 128, weights.data() + from * 128, 128) ||
+                std::memcmp(packed_scales.data() + 8 + to * 8, scales.data() + from * 8, 8 * sizeof(float16_t))) {
+                throw std::runtime_error("fused packing changed weight or scale bytes");
+            }
+        }
+    }
+    for (int i = 0; i < 64; ++i) {
+        if (packed[i] != 193 || packed[weights.size() + 64 + i] != 193) {
+            throw std::runtime_error("fused weight packing overwrote canaries");
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (packed_scales[i] != 91 || packed_scales[scales.size() + 8 + i] != 91) {
+            throw std::runtime_error("fused scale packing overwrote canaries");
+        }
+    }
+    ggml_tmac::fused(k, packed.data() + 64, packed_scales.data() + 8, input);
     for (int r = 0; r < Rows; ++r) {
         alignas(64) float16_t partial[256] = {};
         for (int group = 0; group < groups; ++group) {

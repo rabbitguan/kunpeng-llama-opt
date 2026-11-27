@@ -337,6 +337,7 @@ def execute(args):
                  "stage_profiling": profile_stages, "profiled_outputs_bitwise_equal": True if profile_stages else None,
                  "profiled_backend_sha256": latest.digest(args.out / "profiled-backend.cpp") if profile_stages else None,
                  "fused_consumer": fused, "fused_outputs_bitwise_equal": True if fused else None,
+                 "fused_layout": "output_block_k_v1" if fused else None,
                  "fused_header_sha256": latest.digest(args.out / "fused.h") if fused else None,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "scope": "synthetic 4096x4096 Q4_0, repeated matrix, reusable GGML threadpool, three warmups and ten samples",

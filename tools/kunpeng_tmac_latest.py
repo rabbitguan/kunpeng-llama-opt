@@ -241,6 +241,7 @@ def execute(args):
                 "tmac_baseline": str(args.tmac_baseline), "kernel_N": [1, 2] if fused else 1, "tuning": False,
                 "patch_sha256": digest(PATCH), "generated_sha256": historical["generated_sha256"],
                 "fused_consumer": fused, "fused_header_sha256": digest(ROOT / "ggml/src/ggml-cpu/tmac/fused.h") if fused else None,
+                "fused_layout": "output_block_k_v1" if fused else None,
                 "numa_node_override": getattr(args, "numa_node", None),
                 "limitations": (["fused consumer supports the BM=256,simd_in=16,simd_out=8,kfactor=8 layout; others use N=1 generated kernels"] if fused else ["N=1 generated kernels also process prefill"]) + ["raw and packed weights both resident", "fixed-token smoke is not perplexity evaluation"]}
     selector_patch = args.baseline / "q4-4x4.patch" if frozen.get("upstream_selector_modified") else None
