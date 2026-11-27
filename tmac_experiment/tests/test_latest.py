@@ -1,5 +1,7 @@
 import array
+import argparse
 import importlib.util
+import json
 from pathlib import Path
 import struct
 import shutil
@@ -21,6 +23,63 @@ with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
 
 
 class LatestTest(unittest.TestCase):
+    def test_diagnosis_host_change_uses_new_binding_and_preserves_old_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "completed"
+            run.mkdir()
+            kernel = run / "tmac-prefix/lib/kernels.cc"
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"frozen kernel")
+            profile = {"hostname": "cnkunpengb08", "cpus": list(range(0, 64, 2)), "node": 0,
+                       "toolchain": {"env": {}, "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++"}}
+            frozen = {"status": "smoke_and_benchmark_pass", "commit": latest.PIN, "profile": profile,
+                      "tmac_baseline": str(root / "historical"), "compiled_kernel_sha256": latest.digest(kernel)}
+            (run / "manifest.json").write_text(json.dumps(frozen))
+            for name in ("comparison.json", "correctness.json"):
+                (run / name).write_text("[]")
+            commands = []
+
+            def fake_run(command, log, *, env=None, output=None):
+                commands.append(command)
+                if output is None:
+                    return
+                threads = int(command[-1])
+                tmac = command[-2] == "--bench-tmac"
+                records = [{"rows": count, "threads": threads, "K": 4096, "M": 4096, "status": "pass",
+                            "buffer": "CPU_TMAC" if tmac else "CPU_REPACK", "samples_us": [10.0] * 10,
+                            "median_graph_us": 10.0} for count in (1, 7, 32)]
+                output.write_text("\n".join(json.dumps(row) for row in records))
+                log.write_text(f"tmac: packed tensor=w\ntmac: compute tensor=w threads={threads} kernel_N=1\n")
+
+            topology = "\n".join(f"{cpu},{(cpu - 64) // 2},0,0" for cpu in range(64, 128))
+            args = argparse.Namespace(run=run, out=root / "diagnosis", jobs=4, allow_host_change=False)
+            with mock.patch.object(diagnose.platform, "system", return_value="Linux"), \
+                    mock.patch.object(diagnose.platform, "machine", return_value="aarch64"), \
+                    mock.patch.object(diagnose.platform, "node", return_value="cnkunpengb04"), \
+                    mock.patch.object(diagnose.os, "sched_getaffinity", return_value=set(range(64, 128)), create=True), \
+                    mock.patch.object(diagnose.subprocess, "check_output", return_value=topology), \
+                    mock.patch.object(diagnose.latest, "run", side_effect=fake_run), \
+                    mock.patch.object(diagnose, "probe", return_value={}), \
+                    mock.patch.object(diagnose.shutil, "which", return_value=None), \
+                    mock.patch("builtins.print"):
+                with self.assertRaisesRegex(ValueError, "allow-host-change"):
+                    diagnose.execute(args)
+                self.assertFalse(args.out.exists())
+                args.allow_host_change = True
+                diagnose.execute(args)
+            metadata = json.loads((args.out / "diagnosis.json").read_text())
+            self.assertTrue(metadata["host_changed"])
+            self.assertFalse(metadata["historical_throughput_used"])
+            self.assertEqual(metadata["completed_profile"], profile)
+            self.assertEqual(metadata["execution_profile"]["hostname"], "cnkunpengb04")
+            self.assertEqual(metadata["execution_profile"]["cpus"], list(range(64, 128, 2)))
+            measurements = [command for command in commands if command[0] == "numactl"]
+            self.assertEqual(len(measurements), 6)
+            for command in measurements:
+                expected = list(range(64, 128, 2))[:int(command[-1])]
+                self.assertEqual(command[1], "--physcpubind=" + ",".join(map(str, expected)))
+
     def test_diagnostic_ratio_uses_durations_in_the_correct_direction(self):
         rows = [{"variant": variant, "rows": count, "threads": threads, "median_graph_us": value}
                 for threads in (1, 16, 32) for count in (1, 7, 32)

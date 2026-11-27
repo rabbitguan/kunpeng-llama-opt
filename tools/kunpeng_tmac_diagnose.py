@@ -43,11 +43,13 @@ def execute(args):
     frozen = json.loads((args.run / "manifest.json").read_text())
     if frozen.get("status") != "smoke_and_benchmark_pass" or frozen.get("commit") != latest.PIN:
         raise ValueError("Choose the completed c622f62 T-MAC run")
-    profile = frozen["profile"]
-    if platform.system() != "Linux" or platform.machine() != "aarch64" or platform.node() != profile["hostname"]:
-        raise ValueError("Run on the same Linux AArch64 host as the completed experiment")
-    if not set(profile["cpus"]).issubset(os.sched_getaffinity(0)):
-        raise ValueError("Saved CPUs are unavailable")
+    if platform.system() != "Linux" or platform.machine() != "aarch64":
+        raise ValueError("Run on a Linux AArch64 host")
+    profile = latest.execution_profile(frozen["profile"], args.allow_host_change)
+    host_changed = profile["hostname"] != frozen["profile"]["hostname"]
+    if host_changed:
+        print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. Both operator variants will be measured here; old model throughput is context only.", flush=True)
+        print(f"NUMA node {profile['node']}, current physical CPUs: {profile['cpus']}", flush=True)
     prefix = args.run / "tmac-prefix"
     if latest.digest(prefix / "lib/kernels.cc") != frozen["compiled_kernel_sha256"]:
         raise ValueError("Compiled kernel source changed")
@@ -60,6 +62,7 @@ def execute(args):
             env[name] = value
     env.update(TMAC_KCFG_FILE=str(prefix / "lib/kcfg.ini"), OMP_DYNAMIC="FALSE", TVM_NUM_THREADS="1")
     hardware = {"lscpu": probe(["lscpu"]), "caches": probe(["lscpu", "-C"]),
+                "hostname": profile["hostname"], "completed_run_hostname": frozen["profile"]["hostname"],
                 "numa": probe(["numactl", "--hardware"]), "allowed_cpus": sorted(os.sched_getaffinity(0)),
                 "compiler": probe([profile["toolchain"]["CMAKE_CXX_COMPILER"], "--version"]),
                 "clang_in_path": shutil.which("clang++"), "perf_in_path": shutil.which("perf")}
@@ -114,6 +117,8 @@ def execute(args):
                     subprocess.run([objdump, "-d", "-C", str(obj)], stdout=output, stderr=subprocess.STDOUT, check=True)
     latest.write(args.out / "operator-comparison.json", compare_rows(rows))
     latest.write(args.out / "diagnosis.json", {"status": "pass", "completed_run": str(args.run),
+                 "completed_profile": frozen["profile"], "execution_profile": profile, "host_changed": host_changed,
+                 "historical_throughput_used": False,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "scope": "synthetic 4096x4096 Q4_0, repeated matrix, reusable GGML threadpool, three warmups and ten samples",
                  "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "no model performance claim"]})
@@ -124,6 +129,7 @@ def main():
     parser.add_argument("--run", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--allow-host-change", action="store_true", help="remeasure both operators on this host using current physical cores from the saved NUMA node")
     args = parser.parse_args()
     args.run, args.out = args.run.resolve(), args.out.resolve()
     if args.out.exists() or args.jobs < 1:
