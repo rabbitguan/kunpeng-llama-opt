@@ -73,7 +73,8 @@ inline void fused(int k, const uint8_t * weights, const float16_t * scales, cons
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
-#pragma GCC unroll 8
+// Limit live lookup temporaries on GCC 10.
+#pragma GCC unroll 2
 #endif
             for (int j = 0; j < 8; ++j) {
                 const uint8x16_t packed = vld1q_u8(weights + (size_t(block) * (k / 32) + group) * 128 + j * 16);
@@ -85,9 +86,9 @@ inline void fused(int k, const uint8_t * weights, const float16_t * scales, cons
                     const int8x16_t bottom = vqtbl1q_s8(table, low);
                     const int8x16_t top = vqtbl1q_s8(table, high);
                     sums[r][0] = vaddw_s8(sums[r][0], vget_low_s8(bottom));
-                    sums[r][1] = vaddw_s8(sums[r][1], vget_high_s8(bottom));
+                    sums[r][1] = vaddw_high_s8(sums[r][1], bottom);
                     sums[r][2] = vaddw_s8(sums[r][2], vget_low_s8(top));
-                    sums[r][3] = vaddw_s8(sums[r][3], vget_high_s8(top));
+                    sums[r][3] = vaddw_high_s8(sums[r][3], top);
                 }
             }
             const float16x8_t scale = vld1q_f16(scales + (size_t(block) * (k / 32) + group) * 8);
