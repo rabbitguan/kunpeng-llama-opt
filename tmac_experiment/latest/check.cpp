@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <random>
 #include <memory>
+#include <fstream>
 #include <vector>
 
 static void require(bool ok, const char * message) {
@@ -23,11 +24,16 @@ static void require(bool ok, const char * message) {
 int main(int argc, char ** argv) {
     try {
         const bool benchmark = argc >= 2 && (!strcmp(argv[1], "--bench-tmac") || !strcmp(argv[1], "--bench-native"));
-        require(argc == 1 || (benchmark && argc <= 3), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32]]");
+        require(argc == 1 || (benchmark && argc <= 4), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32 [OUTPUT]]]");
         int selected_threads = 0;
-        if (argc == 3) {
+        if (argc >= 3) {
             require(!strcmp(argv[2], "1") || !strcmp(argv[2], "16") || !strcmp(argv[2], "32"), "invalid thread count");
             selected_threads = std::atoi(argv[2]);
+        }
+        std::ofstream output_file;
+        if (argc == 4) {
+            output_file.open(argv[3], std::ios::binary);
+            require(output_file.good(), "cannot open operator output file");
         }
         const bool native = benchmark && !strcmp(argv[1], "--bench-native");
         const char * buffer_name = native ? "CPU_REPACK" : "CPU_TMAC";
@@ -126,6 +132,10 @@ int main(int argc, char ** argv) {
                 } else {
                     require(single.size() == result.size(), "single-thread reference is unavailable");
                     require(memcmp(single.data(), result.data(), result.size() * sizeof(float)) == 0, "thread counts changed outputs");
+                }
+                if (output_file.is_open()) {
+                    output_file.write(reinterpret_cast<const char *>(result.data()), result.size() * sizeof(float));
+                    require(output_file.good(), "cannot write operator output file");
                 }
                 if (benchmark) {
                     std::vector<double> samples;

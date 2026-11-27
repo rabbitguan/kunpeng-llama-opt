@@ -15,15 +15,45 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("tmac_latest", ROOT / "tools/kunpeng_tmac_latest.py")
+assert SPEC is not None and SPEC.loader is not None
 latest = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(latest)
 with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
     DIAG_SPEC = importlib.util.spec_from_file_location("tmac_diagnose", ROOT / "tools/kunpeng_tmac_diagnose.py")
+    assert DIAG_SPEC is not None and DIAG_SPEC.loader is not None
     diagnose = importlib.util.module_from_spec(DIAG_SPEC)
     DIAG_SPEC.loader.exec_module(diagnose)
 
 
 class LatestTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("TMAC_LATEST_CHECK") and os.environ.get("TMAC_BLOCKED_CHECK"), "set both compiled ARM64 probes")
+    def test_blocked_operator_outputs_match_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for threads in (1, 16, 32):
+                outputs = []
+                for name in ("TMAC_LATEST_CHECK", "TMAC_BLOCKED_CHECK"):
+                    path = root / f"{name}-{threads}.bin"
+                    result = subprocess.run([os.environ[name], "--bench-tmac", str(threads), str(path)],
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    outputs.append(path.read_bytes())
+                self.assertEqual(len(outputs[0]), 4096 * 40 * 4)
+                self.assertEqual(outputs[0], outputs[1])
+
+    def test_blocked_schedule_keeps_original_tile_body(self):
+        original = (ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_text()
+        for block in (1, 4, 8, 16, 32):
+            modified = diagnose.blocked_backend_source(original, block)
+            self.assertIn(f"first_row += {block}", modified)
+            self.assertEqual(modified.count("qgemm_lut_int8("), original.count("qgemm_lut_int8("))
+            self.assertEqual(modified.count("preprocessor_int8("), original.count("preprocessor_int8("))
+        for block in (0, 3, 64):
+            with self.assertRaises(ValueError):
+                diagnose.blocked_backend_source(original, block)
+        with self.assertRaises(ValueError):
+            diagnose.blocked_backend_source(original.replace("task += params->nth", "task++"), 8)
+
     def test_compiler_override_updates_both_compilers_and_checks_availability(self):
         profile = {"toolchain": {"CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++"}}
         with mock.patch.object(diagnose, "probe", return_value={"exit_code": 0, "output": "clang version 17.0.6"}) as probe:
@@ -72,14 +102,25 @@ class LatestTest(unittest.TestCase):
             (run / "manifest.json").write_text(json.dumps(frozen))
             for name in ("comparison.json", "correctness.json"):
                 (run / name).write_text("[]")
+            backend = run / "tmac-source/ggml/src/ggml-cpu/tmac/tmac.cpp"
+            backend.parent.mkdir(parents=True)
+            backend.write_bytes((ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_bytes())
             commands = []
 
             def fake_run(command, log, *, env=None, output=None):
                 commands.append(command)
                 if output is None:
+                    if command[:2] == ["cmake", "--build"]:
+                        build = Path(command[2])
+                        build.mkdir(parents=True, exist_ok=True)
+                        (build / "compile_commands.json").write_text("[]")
+                        (build / "CMakeCache.txt").write_bytes(b"// compiler metadata: \xe0\xff\n")
                     return
-                threads = int(command[-1])
-                tmac = command[-2] == "--bench-tmac"
+                index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
+                threads = int(command[index + 1])
+                tmac = command[index] == "--bench-tmac"
+                if len(command) > index + 2:
+                    Path(command[index + 2]).write_bytes(bytes(4096 * 40 * 4))
                 records = [{"rows": count, "threads": threads, "K": 4096, "M": 4096, "status": "pass",
                             "buffer": "CPU_TMAC" if tmac else "CPU_REPACK", "samples_us": [10.0] * 10,
                             "median_graph_us": 10.0} for count in (1, 7, 32)]
@@ -102,6 +143,18 @@ class LatestTest(unittest.TestCase):
                 self.assertFalse(args.out.exists())
                 args.allow_host_change = True
                 diagnose.execute(args)
+                args.row_block = 8
+                args.out = root / "blocked"
+                diagnose.execute(args)
+            blocked = json.loads((args.out / "diagnosis.json").read_text())
+            self.assertTrue(blocked["blocked_outputs_bitwise_equal"])
+            self.assertEqual(blocked["experimental_row_block"], 8)
+            self.assertEqual((args.out / "original-tmac-CMakeCache.txt").read_bytes(), b"// compiler metadata: \xe0\xff\n")
+            schedule = json.loads((args.out / "schedule-comparison.json").read_text())
+            self.assertEqual(len(schedule), 9)
+            self.assertTrue(all(row["original_over_blocked"] == 1.0 for row in schedule))
+            self.assertEqual(backend.read_bytes(), (ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_bytes())
+            args.out = root / "diagnosis"
             metadata = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(metadata["host_changed"])
             self.assertFalse(metadata["historical_throughput_used"])
@@ -109,9 +162,10 @@ class LatestTest(unittest.TestCase):
             self.assertEqual(metadata["execution_profile"]["hostname"], "cnkunpengb04")
             self.assertEqual(metadata["execution_profile"]["cpus"], list(range(64, 128, 2)))
             measurements = [command for command in commands if command[0] == "numactl"]
-            self.assertEqual(len(measurements), 6)
+            self.assertEqual(len(measurements), 15)
             for command in measurements:
-                expected = list(range(64, 128, 2))[:int(command[-1])]
+                index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
+                expected = list(range(64, 128, 2))[:int(command[index + 1])]
                 self.assertEqual(command[1], "--physcpubind=" + ",".join(map(str, expected)))
 
     def test_diagnostic_ratio_uses_durations_in_the_correct_direction(self):

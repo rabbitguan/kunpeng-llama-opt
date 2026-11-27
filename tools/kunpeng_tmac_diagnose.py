@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare short native/T-MAC operator runs using a completed experiment's sources."""
 import argparse
+import difflib
 import json
 import math
 import os
@@ -51,6 +52,29 @@ def select_compilers(profile, clang_root):
         profile["toolchain"][key + "_version"] = report["output"]
 
 
+def blocked_backend_source(source, block_rows):
+    if block_rows not in (1, 4, 8, 16, 32):
+        raise ValueError("Unsupported diagnostic row block")
+    anchor = ("        for (int64_t task = params->ith; task < int64_t(rows) * c.n_tile_num; task += params->nth) {\n"
+              "            const size_t row = task / c.n_tile_num, tile = task % c.n_tile_num;\n")
+    if source.count(anchor) != 1:
+        raise ValueError("Unrecognized original T-MAC task loop")
+    start = source.index(anchor)
+    end = source.index("        if (params->ith == 0)", start)
+    body = source[start + len(anchor):end]
+    if not body.endswith("        }\n") or body.count("qgemm_lut_int8(") != 1:
+        raise ValueError("Unrecognized T-MAC tile body")
+    body = body[:-len("        }\n")]
+    replacement = "        auto compute_tile = [&](size_t row, size_t tile) {\n" + body + "        };\n"
+    replacement += (f"        for (int first_row = 0; first_row < rows; first_row += {block_rows}) {{\n"
+                    f"            const int last_row = first_row + {block_rows} < rows ? first_row + {block_rows} : rows;\n"
+                    "            for (int tile = params->ith; tile < c.n_tile_num; tile += params->nth) {\n"
+                    "                for (int row = first_row; row < last_row; ++row) {\n"
+                    "                    compute_tile(row, tile);\n"
+                    "                }\n            }\n        }\n")
+    return source[:start] + replacement + source[end:]
+
+
 def execute(args):
     frozen = json.loads((args.run / "manifest.json").read_text())
     if frozen.get("status") != "smoke_and_benchmark_pass" or frozen.get("commit") != latest.PIN:
@@ -79,7 +103,7 @@ def execute(args):
         env["PATH"] = str(clang_root / "bin") + os.pathsep + env.get("PATH", "")
         env["LD_LIBRARY_PATH"] = str(clang_root / "lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         print(f"Toolchain override: {profile['toolchain']['CMAKE_CXX_COMPILER']}", flush=True)
-    hardware = {"lscpu": probe(["lscpu"]), "caches": probe(["lscpu", "-C"]),
+    hardware: dict = {"lscpu": probe(["lscpu"]), "caches": probe(["lscpu", "-C"]),
                 "hostname": profile["hostname"], "completed_run_hostname": frozen["profile"]["hostname"],
                 "numa": probe(["numactl", "--hardware"]), "allowed_cpus": sorted(os.sched_getaffinity(0)),
                 "compiler": probe([profile["toolchain"]["CMAKE_CXX_COMPILER"], "--version"]),
@@ -95,13 +119,25 @@ def execute(args):
     for name in ("manifest.json", "comparison.json", "correctness.json"):
         shutil.copy2(args.run / name, args.out / ("completed-" + name))
     rows = []
-    for variant in ("native", "tmac"):
-        build = args.out / (variant + "-build")
-        source = args.run / (variant + "-source")
+    block_rows = getattr(args, "row_block", None)
+    variants = ("native", "tmac", "blocked") if block_rows is not None else ("native", "tmac")
+    for variant in variants:
+        backend = "native" if variant == "native" else "tmac"
+        build = args.out / (backend + "-build")
+        source = args.run / (backend + "-source")
         flags = ["-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                  "-DGGML_CCACHE=OFF", "-DGGML_OPENMP=ON", "-DGGML_CPU_REPACK=ON", "-DGGML_BLAS=OFF",
                  "-DGGML_CPU_KLEIDIAI=OFF", "-DLLAMA_CURL=OFF", f"-DLLAMA_SOURCE={source}",
-                 f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *latest.tmac_package_flags(prefix)]
+                 f"-DGGML_TMAC={'ON' if backend == 'tmac' else 'OFF'}", *latest.tmac_package_flags(prefix)]
+        if variant == "blocked":
+            original = (source / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_text()
+            modified = blocked_backend_source(original, block_rows)
+            override = args.out / "blocked-backend.cpp"
+            override.write_text(modified)
+            (args.out / "blocked-backend.patch").write_text("".join(difflib.unified_diff(
+                original.splitlines(keepends=True), modified.splitlines(keepends=True),
+                fromfile="original/tmac.cpp", tofile="blocked/tmac.cpp")))
+            flags.append(f"-DTMAC_DIAGNOSTIC_BACKEND_SOURCE={override}")
         flags += [f"-D{key}={profile['toolchain'][key]}" for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")]
         if clang_root is not None:
             flags.append(f"-DCMAKE_PREFIX_PATH={clang_root}")
@@ -110,36 +146,60 @@ def execute(args):
         print(f"Building the {variant} operator probe; log: {log}", flush=True)
         latest.run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
         latest.run(["cmake", "--build", build, "--target", "tmac-latest-check", "--parallel", str(args.jobs)], log, env=env)
+        if block_rows is not None and variant == "tmac":
+            shutil.copy2(build / "compile_commands.json", args.out / "original-tmac-compile_commands.json")
+            shutil.copy2(build / "CMakeCache.txt", args.out / "original-tmac-CMakeCache.txt")
         for threads in (1, 16, 32):
             name = f"{variant}-t{threads}"
             path = args.out / (name + ".jsonl")
             env["OMP_NUM_THREADS"] = str(threads)
             command = ["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"][:threads])),
-                       f"--membind={profile['node']}", str(build / "tmac-latest-check"), "--bench-" + variant, str(threads)]
+                       f"--membind={profile['node']}", str(build / "tmac-latest-check"), "--bench-" + backend, str(threads)]
+            if block_rows is not None and backend == "tmac":
+                data = args.out / (name + ".bin")
+                command.append(str(data))
             print(f"Checking and timing {name}", flush=True)
             latest.run(command, args.out / (name + ".log"), env=env, output=path)
             records = [json.loads(line) for line in path.read_text().splitlines()]
             if len(records) != 3 or {row["rows"] for row in records} != {1, 7, 32}:
                 raise ValueError("Operator probe rows differ")
             for row in records:
-                if row["status"] != "pass" or row["threads"] != threads or row["buffer"] != ("CPU_TMAC" if variant == "tmac" else "CPU_REPACK") or (row["K"], row["M"]) != (4096, 4096):
+                if row["status"] != "pass" or row["threads"] != threads or row["buffer"] != ("CPU_TMAC" if backend == "tmac" else "CPU_REPACK") or (row["K"], row["M"]) != (4096, 4096):
                     raise ValueError("Operator correctness or dispatch check failed")
                 if len(row["samples_us"]) != 10 or not all(math.isfinite(value) and value > 0 for value in row["samples_us"]):
                     raise ValueError("Invalid raw operator samples")
+                if not math.isfinite(row["median_graph_us"]) or row["median_graph_us"] <= 0:
+                    raise ValueError("Invalid operator median")
                 row["variant"] = variant
                 rows.append(row)
-            if variant == "tmac":
+            if backend == "tmac":
                 latest.dispatch(args.out / (name + ".log"), threads)
+            if variant == "blocked":
+                expected = args.out / f"tmac-t{threads}.bin"
+                if data.stat().st_size != 4096 * (1 + 7 + 32) * 4 or data.read_bytes() != expected.read_bytes():
+                    raise ValueError("Blocked scheduling changed output bytes")
         objdump = shutil.which("objdump")
         if objdump and variant == "tmac":
             for index, obj in enumerate(build.rglob("kernels.cc.o")):
                 with (args.out / f"kernels-{index}.asm").open("wb") as output:
                     subprocess.run([objdump, "-d", "-C", str(obj)], stdout=output, stderr=subprocess.STDOUT, check=True)
     latest.write(args.out / "operator-comparison.json", compare_rows(rows))
+    if block_rows is not None:
+        indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
+        comparisons = []
+        for threads in (1, 16, 32):
+            for count in (1, 7, 32):
+                ref = indexed["tmac", count, threads]["median_graph_us"]
+                candidate = indexed["blocked", count, threads]["median_graph_us"]
+                comparisons.append({"rows": count, "threads": threads, "original_us": ref,
+                                    "blocked_us": candidate, "original_over_blocked": ref / candidate})
+        latest.write(args.out / "schedule-comparison.json", comparisons)
     latest.write(args.out / "diagnosis.json", {"status": "pass", "completed_run": str(args.run),
                  "completed_profile": frozen["profile"], "execution_profile": profile, "host_changed": host_changed,
                  "historical_throughput_used": False,
                  "toolchain_override": str(clang_root) if clang_root is not None else None,
+                 "experimental_row_block": block_rows, "blocked_outputs_bitwise_equal": True if block_rows is not None else None,
+                 "blocked_backend_sha256": latest.digest(args.out / "blocked-backend.cpp") if block_rows is not None else None,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "scope": "synthetic 4096x4096 Q4_0, repeated matrix, reusable GGML threadpool, three warmups and ten samples",
                  "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "toolchain changes can also change the OpenMP runtime; inspect build caches", "no model performance claim"]})
@@ -152,6 +212,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--allow-host-change", action="store_true", help="remeasure both operators on this host using current physical cores from the saved NUMA node")
     parser.add_argument("--clang-root", type=Path, help="optional LLVM prefix; build both native and T-MAC with its clang/clang++")
+    parser.add_argument("--row-block", type=int, choices=(1, 4, 8, 16, 32), help="also test experimental weight-tile-first scheduling with this row block")
     args = parser.parse_args()
     args.run, args.out = args.run.resolve(), args.out.resolve()
     if args.clang_root is not None:
@@ -169,7 +230,7 @@ def main():
         if args.out.exists():
             with tarfile.open(args.out / "diagnostics.tar.gz", "w:gz") as archive:
                 for path in args.out.iterdir():
-                    if path.suffix in (".json", ".jsonl", ".log", ".asm"):
+                    if path.suffix in (".json", ".jsonl", ".log", ".asm", ".patch", ".cpp", ".txt"):
                         archive.add(path, arcname=path.name)
                 for path in args.out.glob("*-build/compile_commands.json"):
                     archive.add(path, arcname=str(path.relative_to(args.out)))
