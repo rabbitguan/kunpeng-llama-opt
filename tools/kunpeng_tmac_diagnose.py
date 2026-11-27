@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -213,9 +214,10 @@ def execute(args):
     rows = []
     block_rows = getattr(args, "row_block", None)
     profile_stages = getattr(args, "profile_stages", False)
-    if block_rows is not None and profile_stages:
-        raise ValueError("Choose either row blocking or stage profiling")
-    candidate = "blocked" if block_rows is not None else "profiled" if profile_stages else None
+    fused = getattr(args, "fused", False)
+    if sum((block_rows is not None, profile_stages, fused)) > 1:
+        raise ValueError("Choose one of row blocking, stage profiling or the fused consumer")
+    candidate = "fused" if fused else "blocked" if block_rows is not None else "profiled" if profile_stages else None
     variants = ("native", "tmac", candidate) if candidate is not None else ("native", "tmac")
     stages = []
     for variant in variants:
@@ -226,9 +228,14 @@ def execute(args):
                  "-DGGML_CCACHE=OFF", "-DGGML_OPENMP=ON", "-DGGML_CPU_REPACK=ON", "-DGGML_BLAS=OFF",
                  "-DGGML_CPU_KLEIDIAI=OFF", "-DLLAMA_CURL=OFF", f"-DLLAMA_SOURCE={source}",
                  f"-DGGML_TMAC={'ON' if backend == 'tmac' else 'OFF'}", *latest.tmac_package_flags(prefix)]
+        flags.append(f"-DTMAC_FUSED={'ON' if variant == 'fused' else 'OFF'}")
         if variant == candidate:
             original = (source / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_text()
-            modified = blocked_backend_source(original, block_rows) if variant == "blocked" else profiled_backend_source(original)
+            if variant == "fused":
+                modified = (ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_text()
+                shutil.copy2(ROOT / "ggml/src/ggml-cpu/tmac/fused.h", args.out / "fused.h")
+            else:
+                modified = blocked_backend_source(original, block_rows) if variant == "blocked" else profiled_backend_source(original)
             override = args.out / f"{candidate}-backend.cpp"
             override.write_text(modified)
             (args.out / f"{candidate}-backend.patch").write_text("".join(difflib.unified_diff(
@@ -242,7 +249,13 @@ def execute(args):
         log = args.out / (variant + "-build.log")
         print(f"Building the {variant} operator probe; log: {log}", flush=True)
         latest.run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
-        latest.run(["cmake", "--build", build, "--target", "tmac-latest-check", "--parallel", str(args.jobs)], log, env=env)
+        targets = ["tmac-latest-check"] + (["tmac-fused-check"] if variant == "fused" else [])
+        latest.run(["cmake", "--build", build, "--target", *targets, "--parallel", str(args.jobs)], log, env=env)
+        if variant == "fused":
+            check = args.out / "fused-check.json"
+            latest.run(["numactl", f"--physcpubind={profile['cpus'][0]}", f"--membind={profile['node']}", build / "tmac-fused-check"], args.out / "fused-check.log", env=env, output=check)
+            if json.loads(check.read_text()) != {"status": "pass", "cases": 50, "bitwise_equal": True}:
+                raise ValueError("Fused consumer correctness gate failed")
         if candidate is not None and variant == "tmac":
             shutil.copy2(build / "compile_commands.json", args.out / "original-tmac-compile_commands.json")
             shutil.copy2(build / "CMakeCache.txt", args.out / "original-tmac-CMakeCache.txt")
@@ -271,6 +284,8 @@ def execute(args):
                 rows.append(row)
             if backend == "tmac":
                 latest.dispatch(args.out / (name + ".log"), threads)
+            if variant == "fused" and not re.search(rf"rows=7 threads={threads} kernel_N=2 .*consumer=fused", (args.out / (name + ".log")).read_text()):
+                raise ValueError("Fused two-row consumer did not execute")
             if variant == candidate:
                 expected = args.out / f"tmac-t{threads}.bin"
                 if data.stat().st_size != 4096 * (1 + 7 + 32) * 4 or data.read_bytes() != expected.read_bytes():
@@ -282,7 +297,22 @@ def execute(args):
             for index, obj in enumerate(build.rglob("kernels.cc.o")):
                 with (args.out / f"kernels-{index}.asm").open("wb") as output:
                     subprocess.run([objdump, "-d", "-C", str(obj)], stdout=output, stderr=subprocess.STDOUT, check=True)
+        if objdump and variant == "fused":
+            for index, obj in enumerate(build.rglob("fused-backend.cpp.o")):
+                with (args.out / f"fused-backend-{index}.asm").open("wb") as output:
+                    subprocess.run([objdump, "-d", "-C", str(obj)], stdout=output, stderr=subprocess.STDOUT, check=True)
     latest.write(args.out / "operator-comparison.json", compare_rows(rows))
+    if fused:
+        indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
+        comparisons = []
+        for threads in (1, 16, 32):
+            for count in (1, 7, 32):
+                native = indexed["native", count, threads]["median_graph_us"]
+                original = indexed["tmac", count, threads]["median_graph_us"]
+                modified = indexed["fused", count, threads]["median_graph_us"]
+                comparisons.append({"rows": count, "threads": threads, "native_us": native, "original_us": original,
+                                    "fused_us": modified, "original_over_fused": original / modified, "native_over_fused": native / modified})
+        latest.write(args.out / "fused-comparison.json", comparisons)
     if profile_stages:
         latest.write(args.out / "stage-profile.json", {"records": stages,
                      "scope": "instrumented original T-MAC, input conversion/LUT preparation, LUT barrier wait, qgemm/output conversion",
@@ -306,6 +336,8 @@ def execute(args):
                  "blocked_backend_sha256": latest.digest(args.out / "blocked-backend.cpp") if block_rows is not None else None,
                  "stage_profiling": profile_stages, "profiled_outputs_bitwise_equal": True if profile_stages else None,
                  "profiled_backend_sha256": latest.digest(args.out / "profiled-backend.cpp") if profile_stages else None,
+                 "fused_consumer": fused, "fused_outputs_bitwise_equal": True if fused else None,
+                 "fused_header_sha256": latest.digest(args.out / "fused.h") if fused else None,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "scope": "synthetic 4096x4096 Q4_0, repeated matrix, reusable GGML threadpool, three warmups and ten samples",
                  "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "toolchain changes can also change the OpenMP runtime; inspect build caches", "no model performance claim"]})
@@ -322,6 +354,7 @@ def main():
     parser.add_argument("--clang-root", type=Path, help="optional LLVM prefix; build both native and T-MAC with its clang/clang++")
     parser.add_argument("--row-block", type=int, choices=(1, 4, 8, 16, 32), help="also test experimental weight-tile-first scheduling with this row block")
     parser.add_argument("--profile-stages", action="store_true", help="also measure per-worker preparation, LUT barrier wait and consumption in an instrumented original T-MAC copy")
+    parser.add_argument("--fused", action="store_true", help="use the new fused one/two-row consumer after bitwise correctness checks")
     args = parser.parse_args()
     if args.inspect_host:
         try:
@@ -334,8 +367,8 @@ def main():
         parser.error("--run and --out are required for an experiment")
     if args.numa_node is not None and args.numa_node < 0:
         parser.error("--numa-node must be nonnegative")
-    if args.profile_stages and args.row_block is not None:
-        parser.error("Choose either --row-block or --profile-stages")
+    if sum((args.profile_stages, args.row_block is not None, args.fused)) > 1:
+        parser.error("Choose one of --row-block, --profile-stages or --fused")
     args.run, args.out = args.run.resolve(), args.out.resolve()
     if args.clang_root is not None:
         args.clang_root = args.clang_root.resolve()
@@ -352,7 +385,7 @@ def main():
         if args.out.exists():
             with tarfile.open(args.out / "diagnostics.tar.gz", "w:gz") as archive:
                 for path in args.out.iterdir():
-                    if path.suffix in (".json", ".jsonl", ".log", ".asm", ".patch", ".cpp", ".txt"):
+                    if path.suffix in (".json", ".jsonl", ".log", ".asm", ".patch", ".cpp", ".txt", ".h"):
                         archive.add(path, arcname=path.name)
                 for path in args.out.glob("*-build/compile_commands.json"):
                     archive.add(path, arcname=str(path.relative_to(args.out)))

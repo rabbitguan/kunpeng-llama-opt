@@ -24,8 +24,42 @@ with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
     diagnose = importlib.util.module_from_spec(DIAG_SPEC)
     DIAG_SPEC.loader.exec_module(diagnose)
 
+LEGACY_BACKEND = '''#include <atomic>
+        for (int row = params->ith; row < rows; row += params->nth) {
+            preprocessor_int8();
+        }
+        ggml_barrier(params->threadpool);
+        for (int64_t task = params->ith; task < int64_t(rows) * c.n_tile_num; task += params->nth) {
+            const size_t row = task / c.n_tile_num, tile = task % c.n_tile_num;
+            qgemm_lut_int8(row, tile);
+        }
+        if (params->ith == 0) {
+        }
+'''
+
 
 class LatestTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("TMAC_LATEST_CHECK") and os.environ.get("TMAC_FUSED_CHECK"), "set both compiled ARM64 probes")
+    def test_fused_operator_keeps_outputs_and_uses_two_row_consumer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for threads in (1, 16, 32):
+                outputs = []
+                for name in ("TMAC_LATEST_CHECK", "TMAC_FUSED_CHECK"):
+                    path = root / f"{name}-{threads}.bin"
+                    result = subprocess.run([os.environ[name], "--bench-tmac", str(threads), str(path)],
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    outputs.append(path.read_bytes())
+                    if name == "TMAC_FUSED_CHECK":
+                        self.assertIn(f"rows=7 threads={threads} kernel_N=2", result.stderr)
+                        self.assertIn("consumer=fused", result.stderr)
+                        log = root / "dispatch.log"
+                        log.write_text(result.stderr)
+                        latest.dispatch(log, threads)
+                self.assertEqual(len(outputs[0]), 4096 * 40 * 4)
+                self.assertEqual(outputs[0], outputs[1])
+
     def test_stage_profile_requires_complete_worker_groups_and_skips_warmups(self):
         records = []
         for count in (1, 7, 32):
@@ -118,7 +152,7 @@ class LatestTest(unittest.TestCase):
                 self.assertEqual(outputs[0], outputs[1])
 
     def test_blocked_schedule_keeps_original_tile_body(self):
-        original = (ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_text()
+        original = LEGACY_BACKEND
         for block in (1, 4, 8, 16, 32):
             modified = diagnose.blocked_backend_source(original, block)
             self.assertIn(f"first_row += {block}", modified)
@@ -180,7 +214,7 @@ class LatestTest(unittest.TestCase):
                 (run / name).write_text("[]")
             backend = run / "tmac-source/ggml/src/ggml-cpu/tmac/tmac.cpp"
             backend.parent.mkdir(parents=True)
-            backend.write_bytes((ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_bytes())
+            backend.write_text(LEGACY_BACKEND)
             commands = []
 
             def fake_run(command, log, *, env=None, output=None):
@@ -192,6 +226,9 @@ class LatestTest(unittest.TestCase):
                         (build / "compile_commands.json").write_text("[]")
                         (build / "CMakeCache.txt").write_bytes(b"// compiler metadata: \xe0\xff\n")
                     return
+                if output.name == "fused-check.json":
+                    output.write_text(json.dumps({"status": "pass", "cases": 50, "bitwise_equal": True}))
+                    return
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
                 threads = int(command[index + 1])
                 tmac = command[index] == "--bench-tmac"
@@ -202,6 +239,9 @@ class LatestTest(unittest.TestCase):
                             "median_graph_us": 10.0} for count in (1, 7, 32)]
                 output.write_text("\n".join(json.dumps(row) for row in records))
                 log.write_text(f"tmac: packed tensor=w\ntmac: compute tensor=w threads={threads} kernel_N=1\n")
+                if output.name.startswith("fused-"):
+                    with log.open("a") as stream:
+                        stream.write(f"tmac: compute tensor=w rows=7 threads={threads} kernel_N=2 tiles=64 consumer=fused\n")
                 if output.name.startswith("profiled-"):
                     with log.open("a") as stream:
                         for count in (1, 7, 32):
@@ -235,6 +275,17 @@ class LatestTest(unittest.TestCase):
                 args.profile_stages = True
                 args.out = root / "profiled"
                 diagnose.execute(args)
+                args.profile_stages = False
+                args.fused = True
+                args.out = root / "fused"
+                diagnose.execute(args)
+            fused = json.loads((args.out / "diagnosis.json").read_text())
+            self.assertTrue(fused["fused_outputs_bitwise_equal"])
+            comparisons = json.loads((args.out / "fused-comparison.json").read_text())
+            self.assertEqual(len(comparisons), 9)
+            self.assertTrue(all(row["native_over_fused"] == 1 for row in comparisons))
+            self.assertEqual((args.out / "fused.h").read_bytes(), (ROOT / "ggml/src/ggml-cpu/tmac/fused.h").read_bytes())
+            args.out = root / "profiled"
             profiled = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(profiled["profiled_outputs_bitwise_equal"])
             self.assertTrue(profiled["stage_profiling"])
@@ -253,7 +304,7 @@ class LatestTest(unittest.TestCase):
             schedule = json.loads((args.out / "schedule-comparison.json").read_text())
             self.assertEqual(len(schedule), 9)
             self.assertTrue(all(row["original_over_blocked"] == 1.0 for row in schedule))
-            self.assertEqual(backend.read_bytes(), (ROOT / "ggml/src/ggml-cpu/tmac/tmac.cpp").read_bytes())
+            self.assertEqual(backend.read_text(), LEGACY_BACKEND)
             args.out = root / "diagnosis"
             metadata = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(metadata["host_changed"])
@@ -261,8 +312,8 @@ class LatestTest(unittest.TestCase):
             self.assertEqual(metadata["completed_profile"], profile)
             self.assertEqual(metadata["execution_profile"]["hostname"], "cnkunpengb04")
             self.assertEqual(metadata["execution_profile"]["cpus"], list(range(64, 128, 2)))
-            measurements = [command for command in commands if command[0] == "numactl"]
-            self.assertEqual(len(measurements), 24)
+            measurements = [command for command in commands if command[0] == "numactl" and any(str(value).startswith("--bench-") for value in command)]
+            self.assertEqual(len(measurements), 33)
             for position, command in enumerate(measurements):
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
                 first = 64 if position < 6 else 128
@@ -452,7 +503,7 @@ class LatestTest(unittest.TestCase):
 
     def test_patch_contains_the_current_backend_sources(self):
         patch = latest.PATCH.read_text()
-        for path in ("ggml/src/ggml-cpu/tmac/tmac.h", "ggml/src/ggml-cpu/tmac/tmac.cpp"):
+        for path in ("ggml/src/ggml-cpu/tmac/tmac.h", "ggml/src/ggml-cpu/tmac/tmac.cpp", "ggml/src/ggml-cpu/tmac/fused.h"):
             start = patch.index("+++ b/" + path + "\n")
             section = patch[start:].split("--- ", 1)[0]
             additions = "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")) + "\n"

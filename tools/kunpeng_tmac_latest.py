@@ -57,7 +57,7 @@ def dispatch(log, threads=None):
     computed = set(re.findall(r"tmac: compute tensor=(\S+)", text))
     if not packed or packed != computed:
         raise ValueError(f"Missing T-MAC operator coverage in {log}: {sorted(packed - computed)}")
-    if threads is not None and not re.search(rf"tmac: compute .* threads={threads} kernel_N=1", text):
+    if threads is not None and not re.search(rf"tmac: compute .* threads={threads} kernel_N=[12]\b", text):
         raise ValueError(f"T-MAC did not execute at {threads} threads in {log}")
     return sorted(computed)
 
@@ -196,7 +196,8 @@ def execute(args):
     profile = validate_baseline(frozen)
     if platform.system() != "Linux" or platform.machine() != "aarch64":
         raise ValueError("Run on the Linux AArch64 baseline server")
-    profile = execution_profile(profile, args.allow_host_change)
+    profile = execution_profile(profile, args.allow_host_change, getattr(args, "numa_node", None))
+    fused = getattr(args, "fused", False)
     if profile["hostname"] != frozen["profile"]["hostname"]:
         print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. Both variants will be remeasured; historical throughput is not used.", flush=True)
         print(f"NUMA node {profile['node']}, current physical CPUs: {profile['cpus']}", flush=True)
@@ -237,9 +238,11 @@ def execute(args):
     manifest = {"status": "preparing", "commit": PIN, "baseline": str(args.baseline), "profile": profile,
                 "baseline_profile": frozen["profile"], "host_changed": profile["hostname"] != frozen["profile"]["hostname"],
                 "historical_throughput_used": False,
-                "tmac_baseline": str(args.tmac_baseline), "kernel_N": 1, "tuning": False,
+                "tmac_baseline": str(args.tmac_baseline), "kernel_N": [1, 2] if fused else 1, "tuning": False,
                 "patch_sha256": digest(PATCH), "generated_sha256": historical["generated_sha256"],
-                "limitations": ["N=1 generated kernels also process prefill", "raw and packed weights both resident", "fixed-token smoke is not perplexity evaluation"]}
+                "fused_consumer": fused, "fused_header_sha256": digest(ROOT / "ggml/src/ggml-cpu/tmac/fused.h") if fused else None,
+                "numa_node_override": getattr(args, "numa_node", None),
+                "limitations": (["fused consumer supports the BM=256,simd_in=16,simd_out=8,kfactor=8 layout; others use N=1 generated kernels"] if fused else ["N=1 generated kernels also process prefill"]) + ["raw and packed weights both resident", "fixed-token smoke is not perplexity evaluation"]}
     selector_patch = args.baseline / "q4-4x4.patch" if frozen.get("upstream_selector_modified") else None
     manifest["baseline_selector_patch_sha256"] = digest(selector_patch) if selector_patch else None
     write(out / "manifest.json", manifest)
@@ -288,16 +291,21 @@ def execute(args):
         flags += [f"-D{key}={profile['toolchain'][key]}" for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")]
         flags += ["-DGGML_NATIVE=OFF", f"-DGGML_CPU_ARM_ARCH={profile['arm_arch']}"] if profile.get("arm_arch") else ["-DGGML_NATIVE=ON"]
         flags += [f"-DLLAMA_SOURCE={tree}", f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *tmac_package_flags(prefix)]
+        flags += [f"-DTMAC_FUSED={'ON' if fused and variant == 'tmac' else 'OFF'}"]
         run(["cmake", "-S", ROOT / "tmac_experiment/latest", "-B", build, *flags], log, env=env)
         binaries[variant] = build
     manifest["compiled_half_storage"] = compiled_half_storage(binaries["tmac"] / "CMakeCache.txt")
     write(out / "manifest.json", manifest)
     for variant in ("tmac", "native"):
         build = binaries[variant]
-        targets = ["llama-bench", "tmac-latest-logits"] + (["tmac-latest-check"] if variant == "tmac" else [])
+        targets = ["llama-bench", "tmac-latest-logits"] + (["tmac-latest-check"] + (["tmac-fused-check"] if fused else []) if variant == "tmac" else [])
         run(["cmake", "--build", build, "--target", *targets, "--parallel", args.jobs], log, env=env)
     def affinity(threads):
         return ["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"][:threads])), f"--membind={profile['node']}"]
+    if fused:
+        run([*affinity(1), binaries["tmac"] / "tmac-fused-check"], out / "fused-check.log", env=env, output=out / "fused-check.json")
+        if json.loads((out / "fused-check.json").read_text()) != {"status": "pass", "cases": 50, "bitwise_equal": True}:
+            raise ValueError("Fused consumer correctness gate failed")
     run([*affinity(32), binaries["tmac"] / "tmac-latest-check"], out / "operator.log", env=env, output=out / "operator.jsonl")
     dispatch(out / "operator.log")
     for variant, build in binaries.items():
@@ -352,6 +360,8 @@ def main():
     parser.add_argument("--out", required=True, type=Path, help="new result directory")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--allow-host-change", action="store_true", help="remeasure both variants on this host using 32 allowed physical cores from the saved NUMA node")
+    parser.add_argument("--numa-node", type=int, help="bind both variants' CPUs and memory to this NUMA node")
+    parser.add_argument("--fused", action="store_true", help="use the fused one/two-row T-MAC consumer after its bitwise correctness gate")
     args = parser.parse_args()
     args.baseline, args.tmac_baseline, args.out = (path.resolve() for path in (args.baseline, args.tmac_baseline, args.out))
     if args.out.exists() or args.jobs < 1:

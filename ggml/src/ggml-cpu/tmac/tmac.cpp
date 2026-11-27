@@ -4,6 +4,9 @@
 #include "ggml-quants.h"
 #include "t-mac/INIReader.h"
 #include "t-mac/kernels.h"
+#if defined(GGML_TMAC_FUSED)
+#include "fused.h"
+#endif
 
 #include <atomic>
 #include <climits>
@@ -150,34 +153,80 @@ public:
         auto * local = workspace + size_t(rows) * rw + size_t(params->ith) * tw;
         auto * input = reinterpret_cast<half *>(local);
         auto * output = reinterpret_cast<half *>(local + aligned(size_t(k) * sizeof(half)));
-        for (int row = params->ith; row < rows; row += params->nth) {
-            const auto * src = reinterpret_cast<const float *>(static_cast<const uint8_t *>(activation->data) + size_t(row) * activation->nb[1]);
-            ggml_fp32_to_fp16_row(src, reinterpret_cast<ggml_fp16_t *>(input), k);
-            auto * lut = workspace + size_t(row) * rw;
-            auto * scale = lut + aligned(size_t(k) * 4);
-            auto * bias = scale + aligned(size_t(c.lut_scales_size) * sizeof(half));
-            GGML_ASSERT(preprocessor_int8(m * 4, k, 1, 4, input, scale, bias, lut) == 0);
+        bool fused = false;
+#if defined(GGML_TMAC_FUSED)
+        fused = c.bm == 256 && c.simd_n_in == 16 && c.simd_n_out == 8 && c.kfactor == 8;
+        if (fused) {
+            const int groups = k / 32, chunks = (groups + 31) / 32;
+            for (int64_t task = params->ith; task < int64_t(rows) * chunks; task += params->nth) {
+                const size_t row = task / chunks;
+                const int group = int(task % chunks) * 32;
+                const int count = groups - group < 32 ? groups - group : 32;
+                const auto * src = reinterpret_cast<const float *>(static_cast<const uint8_t *>(activation->data) + row * activation->nb[1]) + group * 32;
+                ggml_fp32_to_fp16_row(src, reinterpret_cast<ggml_fp16_t *>(input), count * 32);
+                auto * lut = workspace + row * rw;
+                auto * scale = reinterpret_cast<float16_t *>(lut + aligned(size_t(k) * 4));
+                auto * bias = reinterpret_cast<float16_t *>(lut + aligned(size_t(k) * 4) + aligned(size_t(c.lut_scales_size) * sizeof(half)));
+                ggml_tmac::prepare(count, reinterpret_cast<float16_t *>(input), reinterpret_cast<int8_t *>(lut) + group * 128, scale + group, bias + group);
+            }
+        }
+#endif
+        if (!fused) {
+            for (int row = params->ith; row < rows; row += params->nth) {
+                const auto * src = reinterpret_cast<const float *>(static_cast<const uint8_t *>(activation->data) + size_t(row) * activation->nb[1]);
+                ggml_fp32_to_fp16_row(src, reinterpret_cast<ggml_fp16_t *>(input), k);
+                auto * lut = workspace + size_t(row) * rw;
+                auto * scale = lut + aligned(size_t(k) * 4);
+                auto * bias = scale + aligned(size_t(c.lut_scales_size) * sizeof(half));
+                GGML_ASSERT(preprocessor_int8(m * 4, k, 1, 4, input, scale, bias, lut) == 0);
+            }
         }
         ggml_barrier(params->threadpool);
         auto * weights = static_cast<uint8_t *>(weight->data) + aligned(ggml_nbytes(weight));
         auto * scales = weights + aligned(size_t(m) * k / 2);
         const size_t weight_stride = size_t(k) * (c.bm / 4) / 2;
         const size_t scale_stride = size_t(c.scales_size / c.n_tile_num) * sizeof(half);
-        for (int64_t task = params->ith; task < int64_t(rows) * c.n_tile_num; task += params->nth) {
-            const size_t row = task / c.n_tile_num, tile = task % c.n_tile_num;
-            auto * lut = workspace + row * rw;
-            auto * scale = lut + aligned(size_t(k) * 4);
-            auto * bias = scale + aligned(size_t(c.lut_scales_size) * sizeof(half));
-            GGML_ASSERT(qgemm_lut_int8(c.bm, k, 1, 4, weights + tile * weight_stride, lut,
-                                     scales + tile * scale_stride, scale, bias, output) == 0);
-            auto * dst = reinterpret_cast<float *>(static_cast<uint8_t *>(op->data) + row * op->nb[1]) + tile * (c.bm / 4);
-            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(output), dst, c.bm / 4);
+#if defined(GGML_TMAC_FUSED)
+        if (fused) {
+            const int row_blocks = (rows + 1) / 2;
+            for (int64_t task = params->ith; task < int64_t(row_blocks) * c.n_tile_num; task += params->nth) {
+                const size_t first = size_t(task / c.n_tile_num) * 2, tile = task % c.n_tile_num;
+                auto * packed = weights + tile * weight_stride;
+                const auto * packed_scales = reinterpret_cast<const float16_t *>(scales + tile * scale_stride);
+                auto make_row = [&](size_t row) {
+                    const auto * lut = workspace + row * rw;
+                    const auto * scale = lut + aligned(size_t(k) * 4);
+                    const auto * bias = scale + aligned(size_t(c.lut_scales_size) * sizeof(half));
+                    auto * dst = reinterpret_cast<float *>(static_cast<uint8_t *>(op->data) + row * op->nb[1]) + tile * 64;
+                    return ggml_tmac::row{reinterpret_cast<const int8_t *>(lut), reinterpret_cast<const float16_t *>(scale), reinterpret_cast<const float16_t *>(bias), dst};
+                };
+                if (first + 1 < size_t(rows)) {
+                    const ggml_tmac::row input_rows[2] = {make_row(first), make_row(first + 1)};
+                    ggml_tmac::fused(k, packed, packed_scales, input_rows);
+                } else {
+                    const ggml_tmac::row input_rows[1] = {make_row(first)};
+                    ggml_tmac::fused(k, packed, packed_scales, input_rows);
+                }
+            }
+        }
+#endif
+        if (!fused) {
+            for (int64_t task = params->ith; task < int64_t(rows) * c.n_tile_num; task += params->nth) {
+                const size_t row = task / c.n_tile_num, tile = task % c.n_tile_num;
+                auto * lut = workspace + row * rw;
+                auto * scale = lut + aligned(size_t(k) * 4);
+                auto * bias = scale + aligned(size_t(c.lut_scales_size) * sizeof(half));
+                GGML_ASSERT(qgemm_lut_int8(c.bm, k, 1, 4, weights + tile * weight_stride, lut,
+                                         scales + tile * scale_stride, scale, bias, output) == 0);
+                auto * dst = reinterpret_cast<float *>(static_cast<uint8_t *>(op->data) + row * op->nb[1]) + tile * (c.bm / 4);
+                ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(output), dst, c.bm / 4);
+            }
         }
         if (params->ith == 0) {
             const unsigned phase = rows == 1 ? 1 : 2;
             if (!(logged.fetch_or(phase) & phase)) {
-                GGML_LOG_INFO("tmac: compute tensor=%s K=%d M=%d rows=%d threads=%d kernel_N=1 tiles=%d\n",
-                              weight->name, k, m, rows, params->nth, c.n_tile_num);
+                GGML_LOG_INFO("tmac: compute tensor=%s K=%d M=%d rows=%d threads=%d kernel_N=%d tiles=%d consumer=%s\n",
+                              weight->name, k, m, rows, params->nth, fused && rows > 1 ? 2 : 1, c.n_tile_num, fused ? "fused" : "generated");
             }
         }
         return true;
