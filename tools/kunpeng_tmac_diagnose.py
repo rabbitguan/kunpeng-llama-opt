@@ -39,6 +39,18 @@ def compare_rows(rows):
     return result
 
 
+def select_compilers(profile, clang_root):
+    if clang_root is None:
+        return
+    for key, binary in (("CMAKE_C_COMPILER", "clang"), ("CMAKE_CXX_COMPILER", "clang++")):
+        path = clang_root / "bin" / binary
+        report = probe([str(path), "--version"])
+        if report.get("exit_code") != 0:
+            raise ValueError(f"Cannot execute {path}: {report}")
+        profile["toolchain"][key] = str(path)
+        profile["toolchain"][key + "_version"] = report["output"]
+
+
 def execute(args):
     frozen = json.loads((args.run / "manifest.json").read_text())
     if frozen.get("status") != "smoke_and_benchmark_pass" or frozen.get("commit") != latest.PIN:
@@ -46,6 +58,8 @@ def execute(args):
     if platform.system() != "Linux" or platform.machine() != "aarch64":
         raise ValueError("Run on a Linux AArch64 host")
     profile = latest.execution_profile(frozen["profile"], args.allow_host_change)
+    clang_root = getattr(args, "clang_root", None)
+    select_compilers(profile, clang_root)
     host_changed = profile["hostname"] != frozen["profile"]["hostname"]
     if host_changed:
         print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. Both operator variants will be measured here; old model throughput is context only.", flush=True)
@@ -61,6 +75,10 @@ def execute(args):
         else:
             env[name] = value
     env.update(TMAC_KCFG_FILE=str(prefix / "lib/kcfg.ini"), OMP_DYNAMIC="FALSE", TVM_NUM_THREADS="1")
+    if clang_root is not None:
+        env["PATH"] = str(clang_root / "bin") + os.pathsep + env.get("PATH", "")
+        env["LD_LIBRARY_PATH"] = str(clang_root / "lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        print(f"Toolchain override: {profile['toolchain']['CMAKE_CXX_COMPILER']}", flush=True)
     hardware = {"lscpu": probe(["lscpu"]), "caches": probe(["lscpu", "-C"]),
                 "hostname": profile["hostname"], "completed_run_hostname": frozen["profile"]["hostname"],
                 "numa": probe(["numactl", "--hardware"]), "allowed_cpus": sorted(os.sched_getaffinity(0)),
@@ -85,6 +103,8 @@ def execute(args):
                  "-DGGML_CPU_KLEIDIAI=OFF", "-DLLAMA_CURL=OFF", f"-DLLAMA_SOURCE={source}",
                  f"-DGGML_TMAC={'ON' if variant == 'tmac' else 'OFF'}", *latest.tmac_package_flags(prefix)]
         flags += [f"-D{key}={profile['toolchain'][key]}" for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")]
+        if clang_root is not None:
+            flags.append(f"-DCMAKE_PREFIX_PATH={clang_root}")
         flags += ["-DGGML_NATIVE=OFF", f"-DGGML_CPU_ARM_ARCH={profile['arm_arch']}"] if profile.get("arm_arch") else ["-DGGML_NATIVE=ON"]
         log = args.out / (variant + "-build.log")
         print(f"Building the {variant} operator probe; log: {log}", flush=True)
@@ -119,9 +139,10 @@ def execute(args):
     latest.write(args.out / "diagnosis.json", {"status": "pass", "completed_run": str(args.run),
                  "completed_profile": frozen["profile"], "execution_profile": profile, "host_changed": host_changed,
                  "historical_throughput_used": False,
+                 "toolchain_override": str(clang_root) if clang_root is not None else None,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "scope": "synthetic 4096x4096 Q4_0, repeated matrix, reusable GGML threadpool, three warmups and ten samples",
-                 "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "no model performance claim"]})
+                 "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "toolchain changes can also change the OpenMP runtime; inspect build caches", "no model performance claim"]})
 
 
 def main():
@@ -130,8 +151,11 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--allow-host-change", action="store_true", help="remeasure both operators on this host using current physical cores from the saved NUMA node")
+    parser.add_argument("--clang-root", type=Path, help="optional LLVM prefix; build both native and T-MAC with its clang/clang++")
     args = parser.parse_args()
     args.run, args.out = args.run.resolve(), args.out.resolve()
+    if args.clang_root is not None:
+        args.clang_root = args.clang_root.resolve()
     if args.out.exists() or args.jobs < 1:
         parser.error("Choose a new --out and positive --jobs")
     try:

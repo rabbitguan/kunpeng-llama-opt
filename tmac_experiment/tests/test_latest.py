@@ -24,6 +24,17 @@ with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
 
 
 class LatestTest(unittest.TestCase):
+    def test_compiler_override_updates_both_compilers_and_checks_availability(self):
+        profile = {"toolchain": {"CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++"}}
+        with mock.patch.object(diagnose, "probe", return_value={"exit_code": 0, "output": "clang version 17.0.6"}) as probe:
+            diagnose.select_compilers(profile, Path("/llvm"))
+        self.assertEqual(profile["toolchain"]["CMAKE_C_COMPILER"], "/llvm/bin/clang")
+        self.assertEqual(profile["toolchain"]["CMAKE_CXX_COMPILER"], "/llvm/bin/clang++")
+        self.assertEqual(probe.call_count, 2)
+        with mock.patch.object(diagnose, "probe", return_value={"error": "not found"}):
+            with self.assertRaisesRegex(ValueError, "Cannot execute"):
+                diagnose.select_compilers(profile, Path("/missing"))
+
     @unittest.skipUnless(os.environ.get("TMAC_LATEST_CHECK"), "set TMAC_LATEST_CHECK to the compiled ARM64 probe")
     def test_operator_processes_with_individually_selected_thread_counts(self):
         binary = os.environ["TMAC_LATEST_CHECK"]
@@ -40,6 +51,11 @@ class LatestTest(unittest.TestCase):
                         self.assertEqual(row["threads"], threads)
                         self.assertEqual(row["status"], "pass")
                         self.assertEqual(len(row["samples_us"]), 10)
+                    if variant == "tmac":
+                        with tempfile.TemporaryDirectory() as directory:
+                            log = Path(directory) / "dispatch.log"
+                            log.write_text(result.stderr)
+                            latest.dispatch(log, threads)
 
     def test_diagnosis_host_change_uses_new_binding_and_preserves_old_profile(self):
         with tempfile.TemporaryDirectory() as directory:

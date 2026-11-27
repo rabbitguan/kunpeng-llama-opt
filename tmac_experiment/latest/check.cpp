@@ -94,12 +94,6 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
             std::vector<float> single, result(expected.size());
-            if (selected_threads > 1) {
-                ggml_backend_cpu_set_n_threads(cpu, 1);
-                require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "single-thread reference compute failed");
-                single.resize(expected.size());
-                ggml_backend_tensor_get(y, single.data(), 0, single.size() * sizeof(float));
-            }
             for (int threads : {1, 16, 32}) {
                 if (selected_threads && threads != selected_threads) continue;
                 auto pool_params = ggml_threadpool_params_default(threads);
@@ -109,6 +103,15 @@ int main(int argc, char ** argv) {
                 ggml_backend_cpu_set_n_threads(cpu, threads);
                 require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "graph compute failed");
                 ggml_backend_tensor_get(y, result.data(), 0, result.size() * sizeof(float));
+                if (threads > 1 && single.empty()) {
+                    ggml_backend_cpu_set_threadpool(cpu, nullptr);
+                    ggml_backend_cpu_set_n_threads(cpu, 1);
+                    require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "single-thread reference compute failed");
+                    single.resize(expected.size());
+                    ggml_backend_tensor_get(y, single.data(), 0, single.size() * sizeof(float));
+                    ggml_backend_cpu_set_n_threads(cpu, threads);
+                    ggml_backend_cpu_set_threadpool(cpu, pool.get());
+                }
                 double error = 0, norm = 0, max_abs = 0;
                 for (size_t i = 0; i < result.size(); ++i) {
                     require(std::isfinite(result[i]), "nonfinite output");
