@@ -26,6 +26,30 @@ with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
 
 
 class LatestTest(unittest.TestCase):
+    def test_host_inspection_counts_busy_smt_siblings(self):
+        topology = "\n".join(f"{cpu},{cpu % 8},0,{(cpu % 8) // 2}" for cpu in (0, 1, 2, 3, 8, 9, 10, 11))
+        before, after = [], []
+        for cpu in (0, 1, 2, 3, 8, 9, 10, 11):
+            busy = 100 if cpu == 8 else 10 if cpu == 2 else 0
+            before.append(f"cpu{cpu} 0 0 0 100 0 0 0 0 0 0")
+            after.append(f"cpu{cpu} {busy} 0 0 {200 - busy} 0 0 0 0 0 0")
+        with mock.patch.object(diagnose.os, "sched_getaffinity", return_value={0, 1, 2, 3}, create=True), \
+                mock.patch.object(diagnose.subprocess, "check_output", return_value=topology), \
+                mock.patch.object(Path, "read_text", side_effect=["\n".join(before), "\n".join(after)]), \
+                mock.patch.object(diagnose.time, "sleep"):
+            result = diagnose.inspect_host()
+        self.assertEqual([row["allowed_physical_cores"] for row in result], [2, 2])
+        self.assertEqual([row["sampled_physical_cores"] for row in result], [2, 2])
+        self.assertEqual([row["cores_with_thread_above_20pct"] for row in result], [1, 0])
+        self.assertEqual([row["max_thread_busy_pct"] for row in result], [100.0, 10.0])
+
+    def test_host_inspection_does_not_require_experiment_paths(self):
+        with mock.patch.object(sys, "argv", ["diagnose", "--inspect-host"]), \
+                mock.patch.object(diagnose, "inspect_host", return_value=[]), \
+                mock.patch.object(diagnose.latest, "run") as run, mock.patch("builtins.print"):
+            self.assertEqual(diagnose.main(), 0)
+        run.assert_not_called()
+
     @unittest.skipUnless(os.environ.get("TMAC_LATEST_CHECK") and os.environ.get("TMAC_BLOCKED_CHECK"), "set both compiled ARM64 probes")
     def test_blocked_operator_outputs_match_original(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -127,12 +151,12 @@ class LatestTest(unittest.TestCase):
                 output.write_text("\n".join(json.dumps(row) for row in records))
                 log.write_text(f"tmac: packed tensor=w\ntmac: compute tensor=w threads={threads} kernel_N=1\n")
 
-            topology = "\n".join(f"{cpu},{(cpu - 64) // 2},0,0" for cpu in range(64, 128))
+            topology = "\n".join(f"{cpu},{cpu // 2},0,{0 if cpu < 128 else 1}" for cpu in range(64, 192))
             args = argparse.Namespace(run=run, out=root / "diagnosis", jobs=4, allow_host_change=False)
             with mock.patch.object(diagnose.platform, "system", return_value="Linux"), \
                     mock.patch.object(diagnose.platform, "machine", return_value="aarch64"), \
                     mock.patch.object(diagnose.platform, "node", return_value="cnkunpengb04"), \
-                    mock.patch.object(diagnose.os, "sched_getaffinity", return_value=set(range(64, 128)), create=True), \
+                    mock.patch.object(diagnose.os, "sched_getaffinity", return_value=set(range(64, 192)), create=True), \
                     mock.patch.object(diagnose.subprocess, "check_output", return_value=topology), \
                     mock.patch.object(diagnose.latest, "run", side_effect=fake_run), \
                     mock.patch.object(diagnose, "probe", return_value={}), \
@@ -144,11 +168,16 @@ class LatestTest(unittest.TestCase):
                 args.allow_host_change = True
                 diagnose.execute(args)
                 args.row_block = 8
+                args.numa_node = 1
                 args.out = root / "blocked"
                 diagnose.execute(args)
             blocked = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(blocked["blocked_outputs_bitwise_equal"])
             self.assertEqual(blocked["experimental_row_block"], 8)
+            self.assertTrue(blocked["numa_node_changed"])
+            self.assertEqual(blocked["completed_profile"], profile)
+            self.assertEqual(blocked["execution_profile"]["node"], 1)
+            self.assertEqual(blocked["execution_profile"]["cpus"], list(range(128, 192, 2)))
             self.assertEqual((args.out / "original-tmac-CMakeCache.txt").read_bytes(), b"// compiler metadata: \xe0\xff\n")
             schedule = json.loads((args.out / "schedule-comparison.json").read_text())
             self.assertEqual(len(schedule), 9)
@@ -163,10 +192,12 @@ class LatestTest(unittest.TestCase):
             self.assertEqual(metadata["execution_profile"]["cpus"], list(range(64, 128, 2)))
             measurements = [command for command in commands if command[0] == "numactl"]
             self.assertEqual(len(measurements), 15)
-            for command in measurements:
+            for position, command in enumerate(measurements):
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
-                expected = list(range(64, 128, 2))[:int(command[index + 1])]
+                first = 64 if position < 6 else 128
+                expected = list(range(first, first + 64, 2))[:int(command[index + 1])]
                 self.assertEqual(command[1], "--physcpubind=" + ",".join(map(str, expected)))
+                self.assertEqual(command[2], "--membind=" + ("0" if position < 6 else "1"))
 
     def test_diagnostic_ratio_uses_durations_in_the_correct_direction(self):
         rows = [{"variant": variant, "rows": count, "threads": threads, "median_graph_us": value}
@@ -282,6 +313,28 @@ class LatestTest(unittest.TestCase):
             actual = latest.execution_profile(profile, False)
         self.assertEqual(actual, profile)
         probe.assert_not_called()
+
+    def test_numa_override_changes_cpu_and_memory_node_without_changing_saved_profile(self):
+        profile = {"hostname": "cnkunpengb04", "node": 0, "cpus": list(range(0, 64, 2))}
+        topology = "\n".join(f"{cpu},{cpu // 2},0,{cpu // 64}" for cpu in range(128))
+        with mock.patch.object(latest.platform, "node", return_value="cnkunpengb04"), \
+                mock.patch.object(latest.os, "sched_getaffinity", return_value=set(range(128)), create=True) as affinity, \
+                mock.patch.object(latest.subprocess, "check_output", return_value=topology):
+            result = latest.execution_profile(profile, False, 1)
+            self.assertEqual(result["node"], 1)
+            self.assertEqual(result["cpus"], list(range(64, 128, 2)))
+            self.assertEqual(profile["node"], 0)
+            self.assertEqual(profile["cpus"], list(range(0, 64, 2)))
+            with self.assertRaisesRegex(ValueError, "0 allowed physical cores"):
+                latest.execution_profile(profile, False, 2)
+            with self.assertRaisesRegex(ValueError, "nonnegative"):
+                latest.execution_profile(profile, False, -1)
+            affinity.return_value = set(range(64, 96))
+            with self.assertRaisesRegex(ValueError, "16 allowed physical cores"):
+                latest.execution_profile(profile, False, 1)
+            profile["hostname"] = "cnkunpengb08"
+            with self.assertRaisesRegex(ValueError, "allow-host-change"):
+                latest.execution_profile(profile, False, 1)
 
     def test_rejects_old_commit_and_changed_protocol(self):
         frozen = {"protocol": 1, "mode": "baseline", "commit": latest.PIN,

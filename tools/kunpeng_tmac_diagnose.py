@@ -11,10 +11,48 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 
 import kunpeng_tmac_latest as latest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def inspect_host():
+    allowed = os.sched_getaffinity(0)
+    topology = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET,NODE"], text=True)
+    cores = {}
+    for line in topology.splitlines():
+        if line and not line.startswith("#"):
+            cpu, core, socket, node = line.split(",")
+            if "-" not in (core, socket, node):
+                cores.setdefault((int(node), socket, core), []).append(int(cpu))
+
+    def counters():
+        result = {}
+        for line in Path("/proc/stat").read_text().splitlines():
+            fields = line.split()
+            if fields and fields[0].startswith("cpu") and fields[0][3:].isdigit():
+                result[int(fields[0][3:])] = list(map(int, fields[1:9]))
+        return result
+
+    before = counters()
+    time.sleep(2)
+    after = counters()
+    busy = {}
+    for cpu in before.keys() & after.keys():
+        delta = [b - a for a, b in zip(before[cpu], after[cpu])]
+        total = sum(delta)
+        if len(delta) == 8 and total > 0 and min(delta) >= 0:
+            busy[cpu] = 100 * (total - delta[3] - delta[4]) / total
+    result = []
+    for node in sorted({key[0] for key in cores}):
+        groups = [cpus for key, cpus in cores.items() if key[0] == node and allowed.intersection(cpus)]
+        loads = [max(busy[cpu] for cpu in cpus) for cpus in groups if all(cpu in busy for cpu in cpus)]
+        result.append({"node": node, "allowed_physical_cores": len(groups), "sampled_physical_cores": len(loads),
+                       "cores_with_thread_above_20pct": sum(value > 20 for value in loads),
+                       "max_thread_busy_pct": max(loads) if loads else None})
+    return result
 
 
 def probe(command):
@@ -81,13 +119,15 @@ def execute(args):
         raise ValueError("Choose the completed c622f62 T-MAC run")
     if platform.system() != "Linux" or platform.machine() != "aarch64":
         raise ValueError("Run on a Linux AArch64 host")
-    profile = latest.execution_profile(frozen["profile"], args.allow_host_change)
+    numa_node = getattr(args, "numa_node", None)
+    profile = latest.execution_profile(frozen["profile"], args.allow_host_change, numa_node)
     clang_root = getattr(args, "clang_root", None)
     select_compilers(profile, clang_root)
     host_changed = profile["hostname"] != frozen["profile"]["hostname"]
     if host_changed:
-        print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. Both operator variants will be measured here; old model throughput is context only.", flush=True)
-        print(f"NUMA node {profile['node']}, current physical CPUs: {profile['cpus']}", flush=True)
+        print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. All operator variants will be measured here; old model throughput is context only.", flush=True)
+    if host_changed or numa_node is not None:
+        print(f"NUMA node {frozen['profile']['node']} -> {profile['node']}, current physical CPUs: {profile['cpus']}", flush=True)
     prefix = args.run / "tmac-prefix"
     if latest.digest(prefix / "lib/kernels.cc") != frozen["compiled_kernel_sha256"]:
         raise ValueError("Compiled kernel source changed")
@@ -104,6 +144,7 @@ def execute(args):
         env["LD_LIBRARY_PATH"] = str(clang_root / "lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
         print(f"Toolchain override: {profile['toolchain']['CMAKE_CXX_COMPILER']}", flush=True)
     hardware: dict = {"lscpu": probe(["lscpu"]), "caches": probe(["lscpu", "-C"]),
+                "topology": probe(["lscpu", "-p=CPU,CORE,SOCKET,NODE"]),
                 "hostname": profile["hostname"], "completed_run_hostname": frozen["profile"]["hostname"],
                 "numa": probe(["numactl", "--hardware"]), "allowed_cpus": sorted(os.sched_getaffinity(0)),
                 "compiler": probe([profile["toolchain"]["CMAKE_CXX_COMPILER"], "--version"]),
@@ -196,6 +237,7 @@ def execute(args):
         latest.write(args.out / "schedule-comparison.json", comparisons)
     latest.write(args.out / "diagnosis.json", {"status": "pass", "completed_run": str(args.run),
                  "completed_profile": frozen["profile"], "execution_profile": profile, "host_changed": host_changed,
+                 "numa_node_override": numa_node, "numa_node_changed": profile["node"] != frozen["profile"]["node"],
                  "historical_throughput_used": False,
                  "toolchain_override": str(clang_root) if clang_root is not None else None,
                  "experimental_row_block": block_rows, "blocked_outputs_bitwise_equal": True if block_rows is not None else None,
@@ -207,13 +249,26 @@ def execute(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--run", type=Path)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--inspect-host", action="store_true", help="only sample per-NUMA CPU load for two seconds, including SMT siblings; no builds or benchmarks")
+    parser.add_argument("--numa-node", type=int, help="remeasure all operators with CPU and memory binding on this NUMA node")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--allow-host-change", action="store_true", help="remeasure both operators on this host using current physical cores from the saved NUMA node")
     parser.add_argument("--clang-root", type=Path, help="optional LLVM prefix; build both native and T-MAC with its clang/clang++")
     parser.add_argument("--row-block", type=int, choices=(1, 4, 8, 16, 32), help="also test experimental weight-tile-first scheduling with this row block")
     args = parser.parse_args()
+    if args.inspect_host:
+        try:
+            print(json.dumps(inspect_host(), indent=2))
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"Failed: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if args.run is None or args.out is None:
+        parser.error("--run and --out are required for an experiment")
+    if args.numa_node is not None and args.numa_node < 0:
+        parser.error("--numa-node must be nonnegative")
     args.run, args.out = args.run.resolve(), args.out.resolve()
     if args.clang_root is not None:
         args.clang_root = args.clang_root.resolve()

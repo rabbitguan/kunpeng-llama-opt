@@ -104,12 +104,15 @@ def validate_baseline(frozen):
     return profile
 
 
-def execution_profile(saved, allow_host_change):
+def execution_profile(saved, allow_host_change, numa_node=None):
     profile = copy.deepcopy(saved)
     hostname = platform.node()
-    if saved["hostname"] != hostname:
-        if not allow_host_change:
-            raise ValueError(f"Baseline host is {saved['hostname']}; current host is {hostname}. Use --allow-host-change to remeasure both variants here")
+    if numa_node is not None and numa_node < 0:
+        raise ValueError("NUMA node must be nonnegative")
+    if saved["hostname"] != hostname and not allow_host_change:
+        raise ValueError(f"Baseline host is {saved['hostname']}; current host is {hostname}. Use --allow-host-change to remeasure both variants here")
+    if saved["hostname"] != hostname or numa_node is not None:
+        node_selected = saved["node"] if numa_node is None else numa_node
         allowed = os.sched_getaffinity(0)
         topology = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET,NODE"], text=True)
         physical = {}
@@ -117,13 +120,13 @@ def execution_profile(saved, allow_host_change):
             if not line or line.startswith("#"):
                 continue
             cpu, core, socket, node = line.split(",")
-            if node == str(saved["node"]) and core != "-" and socket != "-" and int(cpu) in allowed:
+            if node == str(node_selected) and core != "-" and socket != "-" and int(cpu) in allowed:
                 key = (socket, core)
                 physical[key] = min(physical.get(key, int(cpu)), int(cpu))
         cpus = sorted(physical.values())
         if len(cpus) < 32:
-            raise ValueError(f"Current NUMA node {saved['node']} has only {len(cpus)} allowed physical cores; 32 required")
-        profile.update(hostname=hostname, cpus=cpus[:32])
+            raise ValueError(f"Current NUMA node {node_selected} has only {len(cpus)} allowed physical cores; 32 required")
+        profile.update(hostname=hostname, node=node_selected, cpus=cpus[:32])
     if len(profile["cpus"]) != 32 or not set(profile["cpus"]).issubset(os.sched_getaffinity(0)):
         raise ValueError("Saved physical CPU binding is unavailable")
     return profile
@@ -333,7 +336,7 @@ def execute(args):
     comparison = []
     for native, tmac in zip(rows[::2], rows[1::2]):
         comparison.append({"case": native["case"], "threads": native["threads"], "native_tps": native["avg_tps"],
-                           "tmac_tps": tmac["avg_tps"], "tmac_over_native": tmac["avg_tps"] / native["avg_tps"]})
+                           "tmac_tps": tmac["avg_tps"], "tmac_over_native": float(tmac["avg_tps"]) / float(native["avg_tps"])})
     write(out / "comparison.json", comparison)
     if digest(model) != profile["model_sha256"]:
         raise ValueError("Model changed during measurement")
