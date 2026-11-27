@@ -94,6 +94,12 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
             std::vector<float> single, result(expected.size());
+            if (selected_threads > 1) {
+                ggml_backend_cpu_set_n_threads(cpu, 1);
+                require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "single-thread reference compute failed");
+                single.resize(expected.size());
+                ggml_backend_tensor_get(y, single.data(), 0, single.size() * sizeof(float));
+            }
             for (int threads : {1, 16, 32}) {
                 if (selected_threads && threads != selected_threads) continue;
                 auto pool_params = ggml_threadpool_params_default(threads);
@@ -115,6 +121,7 @@ int main(int argc, char ** argv) {
                 if (threads == 1) {
                     single = result;
                 } else {
+                    require(single.size() == result.size(), "single-thread reference is unavailable");
                     require(memcmp(single.data(), result.data(), result.size() * sizeof(float)) == 0, "thread counts changed outputs");
                 }
                 if (benchmark) {

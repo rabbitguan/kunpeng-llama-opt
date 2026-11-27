@@ -2,6 +2,7 @@ import array
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import shutil
@@ -23,6 +24,23 @@ with mock.patch.object(sys, "path", [str(ROOT / "tools"), *sys.path]):
 
 
 class LatestTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("TMAC_LATEST_CHECK"), "set TMAC_LATEST_CHECK to the compiled ARM64 probe")
+    def test_operator_processes_with_individually_selected_thread_counts(self):
+        binary = os.environ["TMAC_LATEST_CHECK"]
+        for variant in ("native", "tmac"):
+            for threads in (1, 16, 32):
+                with self.subTest(variant=variant, threads=threads):
+                    result = subprocess.run([binary, "--bench-" + variant, str(threads)],
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    records = [json.loads(line) for line in result.stdout.splitlines()]
+                    self.assertEqual({row["rows"] for row in records}, {1, 7, 32})
+                    self.assertEqual(len(records), 3)
+                    for row in records:
+                        self.assertEqual(row["threads"], threads)
+                        self.assertEqual(row["status"], "pass")
+                        self.assertEqual(len(row["samples_us"]), 10)
+
     def test_diagnosis_host_change_uses_new_binding_and_preserves_old_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
