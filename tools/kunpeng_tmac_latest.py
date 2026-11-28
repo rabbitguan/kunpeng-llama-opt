@@ -104,6 +104,19 @@ def validate_baseline(frozen):
     return profile
 
 
+def select_benchmarks(profile, threads=None, cases=None):
+    threads = profile["threads"] if threads is None else threads
+    cases = list(profile["cases"]) if cases is None else cases
+    if not threads or len(set(threads)) != len(threads) or any(value not in profile["threads"] for value in threads):
+        raise ValueError("Select distinct baseline thread counts from 1, 16, 32")
+    if not cases or len(set(cases)) != len(cases) or any(value not in profile["cases"] for value in cases):
+        raise ValueError("Select distinct baseline case names")
+    selected = copy.deepcopy(profile)
+    selected["threads"] = [value for value in profile["threads"] if value in threads]
+    selected["cases"] = {key: value for key, value in selected["cases"].items() if key in cases}
+    return selected
+
+
 def execution_profile(saved, allow_host_change, numa_node=None):
     profile = copy.deepcopy(saved)
     hostname = platform.node()
@@ -197,7 +210,10 @@ def execute(args):
     if platform.system() != "Linux" or platform.machine() != "aarch64":
         raise ValueError("Run on the Linux AArch64 baseline server")
     profile = execution_profile(profile, args.allow_host_change, getattr(args, "numa_node", None))
+    profile = select_benchmarks(profile, getattr(args, "threads", None), getattr(args, "cases", None))
+    scope = "full" if profile["threads"] == frozen["profile"]["threads"] and profile["cases"] == frozen["profile"]["cases"] else "subset"
     fused = getattr(args, "fused", False)
+    print(f"Benchmark scope: {scope}; threads={profile['threads']}; cases={list(profile['cases'])}. All correctness gates remain enabled.", flush=True)
     if profile["hostname"] != frozen["profile"]["hostname"]:
         print(f"Host changed: {frozen['profile']['hostname']} -> {profile['hostname']}. Both variants will be remeasured; historical throughput is not used.", flush=True)
         print(f"NUMA node {profile['node']}, current physical CPUs: {profile['cpus']}", flush=True)
@@ -237,7 +253,7 @@ def execute(args):
     log = out / "build.log"
     manifest = {"status": "preparing", "commit": PIN, "baseline": str(args.baseline), "profile": profile,
                 "baseline_profile": frozen["profile"], "host_changed": profile["hostname"] != frozen["profile"]["hostname"],
-                "historical_throughput_used": False,
+                "historical_throughput_used": False, "benchmark_scope": scope,
                 "tmac_baseline": str(args.tmac_baseline), "kernel_N": [1, 2] if fused else 1, "tuning": False,
                 "patch_sha256": digest(PATCH), "generated_sha256": historical["generated_sha256"],
                 "fused_consumer": fused, "fused_header_sha256": digest(ROOT / "ggml/src/ggml-cpu/tmac/fused.h") if fused else None,
@@ -300,16 +316,20 @@ def execute(args):
     for variant in ("tmac", "native"):
         build = binaries[variant]
         targets = ["llama-bench", "tmac-latest-logits"] + (["tmac-latest-check"] + (["tmac-fused-check"] if fused else []) if variant == "tmac" else [])
+        print(f"Building {variant}; log: {log}", flush=True)
         run(["cmake", "--build", build, "--target", *targets, "--parallel", args.jobs], log, env=env)
     def affinity(threads):
         return ["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"][:threads])), f"--membind={profile['node']}"]
     if fused:
+        print("Checking fused kernel correctness", flush=True)
         run([*affinity(1), binaries["tmac"] / "tmac-fused-check"], out / "fused-check.log", env=env, output=out / "fused-check.json")
         if json.loads((out / "fused-check.json").read_text()) != {"status": "pass", "cases": 50, "bitwise_equal": True}:
             raise ValueError("Fused consumer correctness gate failed")
+    print("Checking operator correctness", flush=True)
     run([*affinity(32), binaries["tmac"] / "tmac-latest-check"], out / "operator.log", env=env, output=out / "operator.jsonl")
     dispatch(out / "operator.log")
     for variant, build in binaries.items():
+        print(f"Checking model logits: {variant}; log: {out / (variant + '-logits.log')}", flush=True)
         run([*affinity(32), build / "tmac-latest-logits", model, out / (variant + "-logits.bin")], out / (variant + "-logits.log"), env=env)
     coverage = dispatch(out / "tmac-logits.log")
     correctness = compare_logits(out / "native-logits.bin", out / "tmac-logits.bin")
@@ -317,11 +337,12 @@ def execute(args):
     if any(row["status"] != "pass" for row in correctness):
         raise ValueError("Model logits gate failed; performance comparison stopped")
     rows = []
-    for threads in (1, 16, 32):
+    for threads in profile["threads"]:
         env["OMP_NUM_THREADS"] = str(threads)
-        for case, (pp, tg, depth) in CASES.items():
+        for case, (pp, tg, depth) in profile["cases"].items():
             for variant in ("native", "tmac"):
                 name = f"{variant}-{case}-t{threads}"
+                print(f"Benchmarking {name}", flush=True)
                 command = [*affinity(threads), binaries[variant] / "bin/llama-bench", "-m", model,
                            "-ngl", "0", "-fa", profile["flash_attn"], "-ctk", "f16", "-ctv", "f16",
                            "-b", profile["batch"], "-ub", profile["ubatch"], "-t", threads, "-lm", "mmap",
@@ -363,6 +384,8 @@ def main():
     parser.add_argument("--allow-host-change", action="store_true", help="remeasure both variants on this host using 32 allowed physical cores from the saved NUMA node")
     parser.add_argument("--numa-node", type=int, help="bind both variants' CPUs and memory to this NUMA node")
     parser.add_argument("--fused", action="store_true", help="use the fused one/two-row T-MAC consumer after its bitwise correctness gate")
+    parser.add_argument("--threads", nargs="+", type=int, choices=(1, 16, 32), help="benchmark only these thread counts; correctness still covers all three")
+    parser.add_argument("--cases", nargs="+", choices=tuple(CASES), help="benchmark only these baseline cases; correctness gates remain enabled")
     args = parser.parse_args()
     args.baseline, args.tmac_baseline, args.out = (path.resolve() for path in (args.baseline, args.tmac_baseline, args.out))
     if args.out.exists() or args.jobs < 1:

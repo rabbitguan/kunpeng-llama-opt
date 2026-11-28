@@ -509,6 +509,21 @@ class LatestTest(unittest.TestCase):
             additions = "\n".join(line[1:] for line in section.splitlines() if line.startswith("+") and not line.startswith("+++")) + "\n"
             self.assertEqual(additions, (ROOT / path).read_text())
 
+    def test_benchmark_subset_preserves_baseline_and_canonical_order(self):
+        profile = {"threads": [1, 16, 32], "cases": {key: list(value) for key, value in latest.CASES.items()}}
+        self.assertEqual(latest.select_benchmarks(profile), profile)
+        subset = latest.select_benchmarks(profile, [32, 16], ["tg128_d1024", "tg128"])
+        self.assertEqual(subset["threads"], [16, 32])
+        self.assertEqual(list(subset["cases"]), ["tg128", "tg128_d1024"])
+        self.assertEqual(subset["cases"]["tg128_d1024"], [0, 128, 1024])
+        subset["cases"]["tg128_d1024"][2] = 0
+        self.assertEqual(profile["cases"]["tg128_d1024"], [0, 128, 1024])
+        self.assertEqual(profile["threads"], [1, 16, 32])
+        self.assertEqual(len(profile["cases"]), 4)
+        for threads, cases in (([], None), ([16, 16], None), ([8], None), (None, []), (None, ["tg128", "tg128"]), (None, ["unknown"])):
+            with self.subTest(threads=threads, cases=cases), self.assertRaises(ValueError):
+                latest.select_benchmarks(profile, threads, cases)
+
 
 if __name__ == "__main__":
     unittest.main()
