@@ -68,17 +68,30 @@ def probe(command):
         return {"command": list(map(str, command)), "error": str(error)}
 
 
-def compare_rows(rows):
+def compare_rows(rows, counts=(1, 7, 32)):
     indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
     result = []
     for threads in (1, 16, 32):
-        for count in (1, 7, 32):
+        for count in counts:
             native = indexed["native", count, threads]["median_graph_us"]
             tmac = indexed["tmac", count, threads]["median_graph_us"]
             if not math.isfinite(native) or not math.isfinite(tmac) or native <= 0 or tmac <= 0:
                 raise ValueError("Invalid operator duration")
-            result.append({"rows": count, "threads": threads, "native_us": native,
+            result.append({"rows": count, "threads": threads, "weight_mode": indexed["native", count, threads].get("weight_mode", "hot"), "native_us": native,
                            "tmac_us": tmac, "native_us_over_tmac_us": native / tmac})
+    return result
+
+
+def compare_fused_rows(rows, counts):
+    indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
+    result = []
+    for threads in (1, 16, 32):
+        for count in counts:
+            native = indexed["native", count, threads]["median_graph_us"]
+            original = indexed["tmac", count, threads]["median_graph_us"]
+            modified = indexed["fused", count, threads]["median_graph_us"]
+            result.append({"rows": count, "threads": threads, "weight_mode": indexed["native", count, threads].get("weight_mode", "hot"), "native_us": native, "original_us": original,
+                           "fused_us": modified, "original_over_fused": original / modified, "native_over_fused": native / modified})
     return result
 
 
@@ -147,13 +160,13 @@ def profiled_backend_source(source, fused=False):
     return source
 
 
-def read_stage_profile(log, threads, shape=(4096, 4096)):
+def read_stage_profile(log, threads, shape=(4096, 4096), copies=1):
     records = [json.loads(line[len("tmac: stage "):]) for line in log.read_text().splitlines() if line.startswith("tmac: stage ")]
     result = []
-    for count in (1, 7, 32):
+    for count in ((1,) if copies > 1 else (1, 7, 32)):
         selected = [row for row in records if row["threads"] == threads and row["rows"] == count]
-        if len(selected) != threads * 14:
-            raise ValueError("Expected one correctness compute, three warmups and ten stage samples")
+        if len(selected) != threads * (copies + (26 if copies > 1 else 13)):
+            raise ValueError("Expected verification computes, three warmups and ten stage samples per mode")
         samples: list[dict] = []
         for first in range(0, len(selected), threads):
             workers = sorted(selected[first:first + threads], key=lambda row: row["ith"])
@@ -163,9 +176,12 @@ def read_stage_profile(log, threads, shape=(4096, 4096)):
                 if (row["K"], row["M"]) != shape or any(not math.isfinite(row[key]) or row[key] < 0 for key in ("prepare_us", "wait_us", "consume_us")):
                     raise ValueError("Invalid worker stage duration")
             samples.append({"workers": workers, **{"max_" + key: max(row[key] for row in workers) for key in ("prepare_us", "wait_us", "consume_us")}})
-        samples = samples[4:]
-        result.append({"rows": count, "threads": threads, "samples": samples,
-                       **{"median_max_" + key: statistics.median(row["max_" + key] for row in samples) for key in ("prepare_us", "wait_us", "consume_us")}})
+        modes = [("hot", samples[copies + 3:copies + 13])]
+        if copies > 1:
+            modes.append(("stream", samples[copies + 16:copies + 26]))
+        for mode, measured in modes:
+            result.append({"rows": count, "threads": threads, "weight_mode": mode, "samples": measured,
+                           **{"median_max_" + key: statistics.median(row["max_" + key] for row in measured) for key in ("prepare_us", "wait_us", "consume_us")}})
     return result
 
 
@@ -221,11 +237,18 @@ def execute(args):
     fused = getattr(args, "fused", False)
     shape_name = getattr(args, "shape", "attention")
     shape = SHAPES[shape_name]
+    stream_weights = getattr(args, "stream_weights", False)
+    weight_bytes = shape[0] * shape[1] // 32 * 18
+    copies = ((256 << 20) + weight_bytes - 1) // weight_bytes if stream_weights else 1
+    counts = (1,) if stream_weights else (1, 7, 32)
+    hot_rows = []
     if block_rows is not None and (profile_stages or fused):
         raise ValueError("Row blocking cannot be combined with stage profiling or fusion")
     candidates = (["blocked"] if block_rows is not None else []) + (["fused"] if fused else []) + (["profiled"] if profile_stages else [])
     variants = ["native", "tmac", *candidates]
     print(f"Operator shape: {shape_name}, K={shape[0]}, M={shape[1]}", flush=True)
+    if stream_weights:
+        print(f"Single-row modes: hot weight reuse and {copies} rotating copies ({copies * weight_bytes / (1 << 20):.1f} MiB logical weight data)", flush=True)
     stages = []
     for variant in variants:
         backend = "native" if variant == "native" else "tmac"
@@ -277,15 +300,18 @@ def execute(args):
             env["OMP_NUM_THREADS"] = str(threads)
             command = ["numactl", "--physcpubind=" + ",".join(map(str, profile["cpus"][:threads])),
                        f"--membind={profile['node']}", str(build / "tmac-latest-check"), "--bench-" + backend, str(threads)]
-            if (candidates and backend == "tmac") or shape_name != "attention":
+            if (candidates and backend == "tmac") or shape_name != "attention" or stream_weights:
                 data = args.out / (name + ".bin")
                 command.append(str(data))
-            if shape_name != "attention":
+            if shape_name != "attention" or stream_weights:
                 command.extend(["--shape", str(shape[0]), str(shape[1])])
+            if stream_weights:
+                command.append("--stream-weights")
             print(f"Checking and timing {name}", flush=True)
             latest.run(command, args.out / (name + ".log"), env=env, output=path)
             records = [json.loads(line) for line in path.read_text().splitlines()]
-            if len(records) != 3 or {row["rows"] for row in records} != {1, 7, 32}:
+            modes = {"hot", "stream"} if stream_weights else {"hot"}
+            if len(records) != len(counts) * len(modes) or {(row["rows"], row.get("weight_mode", "hot")) for row in records} != {(count, mode) for count in counts for mode in modes}:
                 raise ValueError("Operator probe rows differ")
             for row in records:
                 if row["status"] != "pass" or row["threads"] != threads or row["buffer"] != ("CPU_TMAC" if backend == "tmac" else "CPU_REPACK") or (row["K"], row["M"]) != shape:
@@ -294,19 +320,26 @@ def execute(args):
                     raise ValueError("Invalid raw operator samples")
                 if not math.isfinite(row["median_graph_us"]) or row["median_graph_us"] <= 0:
                     raise ValueError("Invalid operator median")
+                if not math.isclose(row["median_graph_us"], statistics.median(row["samples_us"]), rel_tol=1e-6, abs_tol=1e-6):
+                    raise ValueError("Operator median differs from raw samples")
+                if stream_weights:
+                    active = copies if row["weight_mode"] == "stream" else 1
+                    if row.get("weight_copies") != active or row.get("allocated_weight_copies") != copies or row.get("weight_working_set_bytes") != weight_bytes * active:
+                        raise ValueError("Weight working set differs")
                 row["variant"] = variant
-                rows.append(row)
+                (hot_rows if stream_weights and row["weight_mode"] == "hot" else rows).append(row)
             if backend == "tmac":
                 latest.dispatch(args.out / (name + ".log"), threads)
-            if variant == "fused" and not re.search(rf"rows=7 threads={threads} kernel_N=2 .*consumer=fused", (args.out / (name + ".log")).read_text()):
-                raise ValueError("Fused two-row consumer did not execute")
+            expected_dispatch = rf"rows=1 threads={threads} kernel_N=1 .*consumer=fused" if stream_weights else rf"rows=7 threads={threads} kernel_N=2 .*consumer=fused"
+            if variant == "fused" and not re.search(expected_dispatch, (args.out / (name + ".log")).read_text()):
+                raise ValueError("Requested fused consumer did not execute")
             if variant in candidates:
                 reference = "fused" if variant == "profiled" and fused else "tmac"
                 expected = args.out / f"{reference}-t{threads}.bin"
-                if data.stat().st_size != shape[1] * (1 + 7 + 32) * 4 or data.read_bytes() != expected.read_bytes():
+                if data.stat().st_size != shape[1] * sum(counts) * 4 or data.read_bytes() != expected.read_bytes():
                     raise ValueError("Diagnostic backend changed output bytes")
             if variant == "profiled":
-                stages.extend(read_stage_profile(args.out / (name + ".log"), threads, shape))
+                stages.extend(read_stage_profile(args.out / (name + ".log"), threads, shape, copies))
         objdump = shutil.which("objdump")
         if objdump and variant == "tmac":
             for index, obj in enumerate(build.rglob("kernels.cc.o")):
@@ -316,28 +349,27 @@ def execute(args):
             for index, obj in enumerate(build.rglob(f"{variant}-backend.cpp.o")):
                 with (args.out / f"{variant}-backend-{index}.asm").open("wb") as output:
                     subprocess.run([objdump, "-d", "-C", str(obj)], stdout=output, stderr=subprocess.STDOUT, check=True)
-    latest.write(args.out / "operator-comparison.json", compare_rows(rows))
+    latest.write(args.out / "operator-comparison.json", compare_rows(rows, counts))
     if fused:
-        indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
-        comparisons = []
-        for threads in (1, 16, 32):
-            for count in (1, 7, 32):
-                native = indexed["native", count, threads]["median_graph_us"]
-                original = indexed["tmac", count, threads]["median_graph_us"]
-                modified = indexed["fused", count, threads]["median_graph_us"]
-                comparisons.append({"rows": count, "threads": threads, "native_us": native, "original_us": original,
-                                    "fused_us": modified, "original_over_fused": original / modified, "native_over_fused": native / modified})
-        latest.write(args.out / "fused-comparison.json", comparisons)
+        latest.write(args.out / "fused-comparison.json", compare_fused_rows(rows, counts))
+    if stream_weights:
+        if fused:
+            latest.write(args.out / "hot-fused-comparison.json", compare_fused_rows(hot_rows, counts))
+        hot = {(row["variant"], row["threads"]): row["median_graph_us"] for row in hot_rows}
+        latest.write(args.out / "working-set-comparison.json", [
+            {"variant": row["variant"], "threads": row["threads"], "hot_us": hot[row["variant"], row["threads"]],
+             "stream_us": row["median_graph_us"], "stream_over_hot": row["median_graph_us"] / hot[row["variant"], row["threads"]]}
+            for row in rows if row["variant"] != "profiled"])
     if profile_stages:
         latest.write(args.out / "stage-profile.json", {"records": stages,
                      "shape": {"K": shape[0], "M": shape[1]},
                      "scope": f"instrumented {'fused' if fused else 'original'} T-MAC, input conversion/LUT preparation, LUT barrier wait, consumption/output conversion",
-                     "limitations": ["stage maxima can come from different workers and must not be added as a total", "instrumented graph timing includes an added end barrier and logging; use uninstrumented controls for performance comparisons", "ten samples after one correctness compute and three warmups"]})
+                     "limitations": ["stage maxima can come from different workers and must not be added as a total", "instrumented graph timing includes an added end barrier and logging; use uninstrumented controls for performance comparisons", f"ten samples per mode after {copies} verification computes and three warmups per mode"]})
     if block_rows is not None:
         indexed = {(row["variant"], row["rows"], row["threads"]): row for row in rows}
         comparisons = []
         for threads in (1, 16, 32):
-            for count in (1, 7, 32):
+            for count in counts:
                 ref = indexed["tmac", count, threads]["median_graph_us"]
                 candidate = indexed["blocked", count, threads]["median_graph_us"]
                 comparisons.append({"rows": count, "threads": threads, "original_us": ref,
@@ -357,8 +389,9 @@ def execute(args):
                  "fused_header_sha256": latest.digest(args.out / "fused.h") if fused else None,
                  "check_source_sha256": latest.digest(ROOT / "tmac_experiment/latest/check.cpp"),
                  "shape": {"name": shape_name, "K": shape[0], "M": shape[1]},
-                 "scope": f"synthetic Q4_0 K={shape[0]}, M={shape[1]}, repeated matrix, reusable GGML threadpool, three warmups and ten samples",
-                 "limitations": ["operator timing includes graph dispatch and planning", "single repeated matrix has different cache behavior from a full model", "toolchain changes can also change the OpenMP runtime; inspect build caches", "no model performance claim"]})
+                 "stream_weights": stream_weights, "weight_copies": copies, "weight_working_set_bytes": copies * weight_bytes,
+                 "scope": f"synthetic Q4_0 K={shape[0]}, M={shape[1]}, {'single-row hot and rotating weight sets' if stream_weights else 'repeated matrix'}, reusable GGML threadpool, three warmups and ten samples per mode",
+                 "limitations": ["operator timing includes graph dispatch and planning", "weight working-set probes do not include full-model attention or KV-cache traffic", "toolchain changes can also change the OpenMP runtime; inspect build caches", "no model performance claim"]})
 
 
 def main():
@@ -374,6 +407,7 @@ def main():
     parser.add_argument("--profile-stages", action="store_true", help="also profile per-worker preparation, LUT barrier wait and consumption; combine with --fused to profile the current consumer")
     parser.add_argument("--fused", action="store_true", help="use the new fused one/two-row consumer after bitwise correctness checks")
     parser.add_argument("--shape", choices=tuple(SHAPES), default="attention", help="select one actual Llama-3-8B projection shape")
+    parser.add_argument("--stream-weights", action="store_true", help="compare single-row hot weights with a rotating weight set of at least 256 MiB in each process")
     args = parser.parse_args()
     if args.inspect_host:
         try:

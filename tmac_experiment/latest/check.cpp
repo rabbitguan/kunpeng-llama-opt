@@ -24,13 +24,15 @@ static void require(bool ok, const char * message) {
 int main(int argc, char ** argv) {
     try {
         const bool benchmark = argc >= 2 && (!strcmp(argv[1], "--bench-tmac") || !strcmp(argv[1], "--bench-native"));
-        require(argc == 1 || (benchmark && (argc <= 5 || argc == 7)), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32 [OUTPUT [1024|4096 | --shape K M]]]]");
+        require(argc == 1 || (benchmark && (argc <= 5 || argc == 7 || argc == 8)), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32 [OUTPUT [1024|4096 | --shape K M [--stream-weights]]]]]");
         if (argc == 5) require(!strcmp(argv[4], "1024") || !strcmp(argv[4], "4096"), "invalid output dimension");
-        if (argc == 7) {
+        if (argc >= 7) {
             const bool supported = (!strcmp(argv[5], "4096") && (!strcmp(argv[6], "1024") || !strcmp(argv[6], "4096") || !strcmp(argv[6], "14336"))) ||
                                    (!strcmp(argv[5], "14336") && !strcmp(argv[6], "4096"));
             require(!strcmp(argv[4], "--shape") && supported, "unsupported model matrix shape");
         }
+        const bool stream_weights = argc == 8;
+        if (stream_weights) require(!strcmp(argv[7], "--stream-weights"), "invalid working-set option");
         int selected_threads = 0;
         if (argc >= 3) {
             require(!strcmp(argv[2], "1") || !strcmp(argv[2], "16") || !strcmp(argv[2], "32"), "invalid thread count");
@@ -55,12 +57,20 @@ int main(int argc, char ** argv) {
             }
         }
         require(buft != nullptr, "requested CPU buffer is unavailable");
-        const int k = argc == 7 ? std::atoi(argv[5]) : 4096;
-        const int m = argc == 7 ? std::atoi(argv[6]) : argc == 5 ? std::atoi(argv[4]) : 4096;
-        auto * wc = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
+        const int k = argc >= 7 ? std::atoi(argv[5]) : 4096;
+        const int m = argc >= 7 ? std::atoi(argv[6]) : argc == 5 ? std::atoi(argv[4]) : 4096;
+        const size_t weight_bytes = ggml_row_size(GGML_TYPE_Q4_0, k) * size_t(m);
+        const int copies = stream_weights ? int(((size_t(256) << 20) + weight_bytes - 1) / weight_bytes) : 1;
+        require(copies >= 1 && copies <= 128, "weight working set is too large");
+        auto * wc = ggml_init({ggml_tensor_overhead() * (copies + 1), nullptr, true});
         require(wc != nullptr, "weight context failed");
-        auto * w = ggml_new_tensor_2d(wc, GGML_TYPE_Q4_0, k, m);
-        ggml_set_name(w, "blk.0.attn_q.weight");
+        std::vector<ggml_tensor *> weights;
+        for (int copy = 0; copy < copies; ++copy) {
+            auto * weight = ggml_new_tensor_2d(wc, GGML_TYPE_Q4_0, k, m);
+            ggml_set_name(weight, "blk.0.attn_q.weight");
+            weights.push_back(weight);
+        }
+        auto * w = weights.front();
         auto * wb = ggml_backend_alloc_ctx_tensors_from_buft(wc, buft);
         require(wb != nullptr, "weight allocation failed");
         std::vector<uint8_t> raw(ggml_nbytes(w));
@@ -72,13 +82,16 @@ int main(int argc, char ** argv) {
                 raw[block * 18 + 2 + j] = uint8_t(random());
             }
         }
-        ggml_backend_tensor_set(w, raw.data(), 0, raw.size());
-        if (!native) {
-            std::vector<uint8_t> readback(raw.size());
-            ggml_backend_tensor_get(w, readback.data(), 0, readback.size());
-            require(readback == raw, "raw weight readback changed");
+        for (auto * weight : weights) {
+            ggml_backend_tensor_set(weight, raw.data(), 0, raw.size());
+            if (!native) {
+                std::vector<uint8_t> readback(raw.size());
+                ggml_backend_tensor_get(weight, readback.data(), 0, readback.size());
+                require(readback == raw, "raw weight readback changed");
+            }
         }
         for (int rows : {1, 7, 32}) {
+            if (stream_weights && rows != 1) continue;
             auto * ctx = ggml_init({ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true});
             require(ctx != nullptr, "graph context failed");
             auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
@@ -109,6 +122,7 @@ int main(int argc, char ** argv) {
             std::vector<float> single, result(expected.size());
             for (int threads : {1, 16, 32}) {
                 if (selected_threads && threads != selected_threads) continue;
+                y->src[0] = w;
                 auto pool_params = ggml_threadpool_params_default(threads);
                 std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&pool_params), ggml_threadpool_free);
                 require(bool(pool), "threadpool creation failed");
@@ -144,20 +158,37 @@ int main(int argc, char ** argv) {
                     output_file.write(reinterpret_cast<const char *>(result.data()), result.size() * sizeof(float));
                     require(output_file.good(), "cannot write operator output file");
                 }
-                if (benchmark) {
-                    std::vector<double> samples;
-                    for (int round = -3; round < 10; ++round) {
-                        const auto start = std::chrono::steady_clock::now();
-                        require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "timed compute failed");
-                        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-                        if (round >= 0) samples.push_back(us);
+                if (copies > 1) {
+                    std::vector<float> copy_result(result.size());
+                    for (int copy = 1; copy < copies; ++copy) {
+                        for (int previous = 0; previous < copy; ++previous) {
+                            require(weights[copy]->data != weights[previous]->data, "weight copies share an address");
+                        }
+                        y->src[0] = weights[copy];
+                        require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "weight-copy compute failed");
+                        ggml_backend_tensor_get(y, copy_result.data(), 0, copy_result.size() * sizeof(float));
+                        require(std::memcmp(copy_result.data(), result.data(), result.size() * sizeof(float)) == 0, "weight copies changed outputs");
                     }
-                    auto ordered = samples;
-                    std::sort(ordered.begin(), ordered.end());
-                    std::printf("{\"buffer\":\"%s\",\"K\":%d,\"M\":%d,\"rows\":%d,\"threads\":%d,\"nmse\":%.9g,\"max_abs\":%.9g,\"median_graph_us\":%.6f,\"samples_us\":[",
-                                buffer_name, k, m, rows, threads, error / norm, max_abs, (ordered[4] + ordered[5]) / 2);
-                    for (size_t i = 0; i < samples.size(); ++i) std::printf("%s%.6f", i ? "," : "", samples[i]);
-                    std::printf("],\"status\":\"pass\"}\n");
+                }
+                if (benchmark) {
+                    for (int mode = 0; mode < (stream_weights ? 2 : 1); ++mode) {
+                        const int active_copies = mode == 1 ? copies : 1;
+                        std::vector<double> samples;
+                        for (int round = -3; round < 10; ++round) {
+                            y->src[0] = weights[(round + 3) % active_copies];
+                            const auto start = std::chrono::steady_clock::now();
+                            require(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS, "timed compute failed");
+                            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                            if (round >= 0) samples.push_back(us);
+                        }
+                        auto ordered = samples;
+                        std::sort(ordered.begin(), ordered.end());
+                        std::printf("{\"buffer\":\"%s\",\"K\":%d,\"M\":%d,\"rows\":%d,\"threads\":%d,\"weight_mode\":\"%s\",\"weight_copies\":%d,\"allocated_weight_copies\":%d,\"weight_working_set_bytes\":%zu,\"nmse\":%.9g,\"max_abs\":%.9g,\"median_graph_us\":%.6f,\"samples_us\":[",
+                                    buffer_name, k, m, rows, threads, mode == 1 ? "stream" : "hot", active_copies, copies, weight_bytes * active_copies,
+                                    error / norm, max_abs, (ordered[4] + ordered[5]) / 2);
+                        for (size_t i = 0; i < samples.size(); ++i) std::printf("%s%.6f", i ? "," : "", samples[i]);
+                        std::printf("],\"status\":\"pass\"}\n");
+                    }
                 } else {
                     std::printf("{\"rows\":%d,\"threads\":%d,\"nmse\":%.9g,\"max_abs\":%.9g,\"status\":\"pass\"}\n", rows, threads, error / norm, max_abs);
                 }

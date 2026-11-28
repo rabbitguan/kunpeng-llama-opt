@@ -80,6 +80,31 @@ class LatestTest(unittest.TestCase):
                 else:
                     self.assertEqual(output.read_bytes(), expected)
 
+    @unittest.skipUnless(os.environ.get("TMAC_STREAM_CHECK"), "set the compiled streaming ARM64 probe")
+    def test_streaming_weights_preserve_results_and_report_both_working_sets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for stream in (False, True):
+                output = Path(directory) / f"stream-{stream}.bin"
+                command = [os.environ["TMAC_STREAM_CHECK"], "--bench-tmac", "16", str(output), "--shape", "14336", "4096"]
+                if stream:
+                    command.append("--stream-weights")
+                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = [json.loads(line) for line in result.stdout.splitlines()]
+                if stream:
+                    self.assertEqual({row["weight_mode"] for row in records}, {"hot", "stream"})
+                    self.assertEqual(len(records), 2)
+                    for row in records:
+                        copies = 9 if row["weight_mode"] == "stream" else 1
+                        self.assertEqual((row["rows"], row["weight_copies"], row["allocated_weight_copies"]), (1, copies, 9))
+                        self.assertEqual(row["weight_working_set_bytes"], copies * 14336 * 4096 // 32 * 18)
+                        self.assertEqual(len(row["samples_us"]), 10)
+                        self.assertEqual(row["status"], "pass")
+                paths.append(output)
+            self.assertEqual(len(paths[1].read_bytes()), 4096 * 4)
+            self.assertEqual(paths[1].read_bytes(), paths[0].read_bytes()[:4096 * 4])
+
     def test_stage_profile_requires_complete_worker_groups_and_skips_warmups(self):
         records = []
         for count in (1, 7, 32):
@@ -254,25 +279,32 @@ class LatestTest(unittest.TestCase):
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
                 threads = int(command[index + 1])
                 tmac = command[index] == "--bench-tmac"
-                k, m = (int(value) for value in command[-2:]) if "--shape" in command else (4096, 4096)
+                k, m = (int(value) for value in command[command.index("--shape") + 1:command.index("--shape") + 3]) if "--shape" in command else (4096, 4096)
+                stream = "--stream-weights" in command
+                weight_bytes = k * m // 32 * 18
+                copies = ((256 << 20) + weight_bytes - 1) // weight_bytes if stream else 1
+                counts = (1,) if stream else (1, 7, 32)
                 if len(command) > index + 2:
-                    Path(command[index + 2]).write_bytes(bytes(m * 40 * 4))
+                    Path(command[index + 2]).write_bytes(bytes(m * sum(counts) * 4))
                 records = [{"rows": count, "threads": threads, "K": k, "M": m, "status": "pass",
-                            "buffer": "CPU_TMAC" if tmac else "CPU_REPACK", "samples_us": [10.0] * 10,
-                            "median_graph_us": 10.0} for count in (1, 7, 32)]
+                            "weight_mode": mode, "weight_copies": copies if mode == "stream" else 1,
+                            "allocated_weight_copies": copies, "weight_working_set_bytes": weight_bytes * (copies if mode == "stream" else 1),
+                            "buffer": "CPU_TMAC" if tmac else "CPU_REPACK", "samples_us": [20.0 if mode == "stream" else 10.0] * 10,
+                            "median_graph_us": 20.0 if mode == "stream" else 10.0} for count in counts for mode in (("hot", "stream") if stream else ("hot",))]
                 output.write_text("\n".join(json.dumps(row) for row in records))
                 log.write_text(f"tmac: packed tensor=w\ntmac: compute tensor=w threads={threads} kernel_N=1\n")
                 if output.name.startswith("fused-"):
-                    with log.open("a") as stream:
-                        stream.write(f"tmac: compute tensor=w rows=7 threads={threads} kernel_N=2 tiles=64 consumer=fused\n")
+                    with log.open("a") as log_stream:
+                        log_stream.write(f"tmac: compute tensor=w rows=1 threads={threads} kernel_N=1 tiles=64 consumer=fused\n")
+                        log_stream.write(f"tmac: compute tensor=w rows=7 threads={threads} kernel_N=2 tiles=64 consumer=fused\n")
                 if output.name.startswith("profiled-"):
-                    with log.open("a") as stream:
-                        for count in (1, 7, 32):
-                            for round in range(14):
+                    with log.open("a") as log_stream:
+                        for count in counts:
+                            for round in range(copies + (26 if stream else 13)):
                                 for worker in range(threads):
                                     row = {"K": k, "M": m, "rows": count, "threads": threads, "ith": worker,
-                                           "prepare_us": 1.0, "wait_us": 2.0, "consume_us": 3.0}
-                                    stream.write("tmac: stage " + json.dumps(row) + "\n")
+                                           "prepare_us": 1.0, "wait_us": 2.0, "consume_us": 6.0 if stream and round >= copies + 13 else 3.0}
+                                    log_stream.write("tmac: stage " + json.dumps(row) + "\n")
 
             topology = "\n".join(f"{cpu},{cpu // 2},0,{0 if cpu < 128 else 1}" for cpu in range(64, 192))
             args = argparse.Namespace(run=run, out=root / "diagnosis", jobs=4, allow_host_change=False)
@@ -304,15 +336,23 @@ class LatestTest(unittest.TestCase):
                 diagnose.execute(args)
                 args.profile_stages = True
                 args.shape = "ffn-down"
+                args.stream_weights = True
                 args.out = root / "fused-profiled"
                 diagnose.execute(args)
             combined = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(combined["fused_outputs_bitwise_equal"])
             self.assertTrue(combined["profiled_outputs_bitwise_equal"])
             self.assertEqual(combined["shape"], {"name": "ffn-down", "K": 14336, "M": 4096})
+            self.assertEqual(combined["weight_copies"], 9)
+            working_sets = json.loads((args.out / "working-set-comparison.json").read_text())
+            self.assertEqual(len(working_sets), 9)
+            self.assertTrue(all(row["stream_over_hot"] == 2 for row in working_sets))
             combined_stages = json.loads((args.out / "stage-profile.json").read_text())
             self.assertIn("instrumented fused", combined_stages["scope"])
             self.assertEqual(combined_stages["shape"], {"K": 14336, "M": 4096})
+            self.assertEqual(len(combined_stages["records"]), 6)
+            for row in combined_stages["records"]:
+                self.assertEqual(row["median_max_consume_us"], 6 if row["weight_mode"] == "stream" else 3)
             self.assertNotIn("profile_clock", (args.out / "fused-backend.cpp").read_text())
             self.assertIn("profile_clock", (args.out / "profiled-backend.cpp").read_text())
             self.assertTrue((args.out / "fused-compile_commands.json").exists())
