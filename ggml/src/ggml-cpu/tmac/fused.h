@@ -27,6 +27,17 @@ struct row {
     float * output;
 };
 
+inline int16x8_t add_low(int16x8_t sum, int8x16_t values) {
+#if defined(__GNUC__) && !defined(__clang__)
+    // GCC 10 copies the low half before the equivalent intrinsic.
+    int16x8_t result;
+    __asm__("saddw %0.8h, %1.8h, %2.8b" : "=w"(result) : "w"(sum), "w"(values));
+    return result;
+#else
+    return vaddw_s8(sum, vget_low_s8(values));
+#endif
+}
+
 inline void pack(int k, const uint8_t * weights, const float16_t * scales, uint8_t * packed, float16_t * packed_scales) {
     const int groups = k / 32;
     for (int block = 0; block < 8; ++block) {
@@ -85,9 +96,9 @@ inline void fused(int k, const uint8_t * weights, const float16_t * scales, cons
                     const int8x16_t table = vld1q_s8(input[r].lut + group * 128 + j * 16);
                     const int8x16_t bottom = vqtbl1q_s8(table, low);
                     const int8x16_t top = vqtbl1q_s8(table, high);
-                    sums[r][0] = vaddw_s8(sums[r][0], vget_low_s8(bottom));
+                    sums[r][0] = add_low(sums[r][0], bottom);
                     sums[r][1] = vaddw_high_s8(sums[r][1], bottom);
-                    sums[r][2] = vaddw_s8(sums[r][2], vget_low_s8(top));
+                    sums[r][2] = add_low(sums[r][2], top);
                     sums[r][3] = vaddw_high_s8(sums[r][3], top);
                 }
             }
