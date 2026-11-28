@@ -93,6 +93,8 @@ class LatestTest(unittest.TestCase):
                 log.write_text("\n".join("tmac: stage " + json.dumps(row) for row in records))
             write_records()
             result = diagnose.read_stage_profile(log, 2)
+            with self.assertRaisesRegex(ValueError, "stage duration"):
+                diagnose.read_stage_profile(log, 2, (14336, 4096))
             self.assertEqual(len(result), 3)
             for row in result:
                 self.assertEqual(len(row["samples"]), 10)
@@ -252,9 +254,10 @@ class LatestTest(unittest.TestCase):
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
                 threads = int(command[index + 1])
                 tmac = command[index] == "--bench-tmac"
+                k, m = (int(value) for value in command[-2:]) if "--shape" in command else (4096, 4096)
                 if len(command) > index + 2:
-                    Path(command[index + 2]).write_bytes(bytes(4096 * 40 * 4))
-                records = [{"rows": count, "threads": threads, "K": 4096, "M": 4096, "status": "pass",
+                    Path(command[index + 2]).write_bytes(bytes(m * 40 * 4))
+                records = [{"rows": count, "threads": threads, "K": k, "M": m, "status": "pass",
                             "buffer": "CPU_TMAC" if tmac else "CPU_REPACK", "samples_us": [10.0] * 10,
                             "median_graph_us": 10.0} for count in (1, 7, 32)]
                 output.write_text("\n".join(json.dumps(row) for row in records))
@@ -267,7 +270,7 @@ class LatestTest(unittest.TestCase):
                         for count in (1, 7, 32):
                             for round in range(14):
                                 for worker in range(threads):
-                                    row = {"K": 4096, "M": 4096, "rows": count, "threads": threads, "ith": worker,
+                                    row = {"K": k, "M": m, "rows": count, "threads": threads, "ith": worker,
                                            "prepare_us": 1.0, "wait_us": 2.0, "consume_us": 3.0}
                                     stream.write("tmac: stage " + json.dumps(row) + "\n")
 
@@ -299,6 +302,22 @@ class LatestTest(unittest.TestCase):
                 args.fused = True
                 args.out = root / "fused"
                 diagnose.execute(args)
+                args.profile_stages = True
+                args.shape = "ffn-down"
+                args.out = root / "fused-profiled"
+                diagnose.execute(args)
+            combined = json.loads((args.out / "diagnosis.json").read_text())
+            self.assertTrue(combined["fused_outputs_bitwise_equal"])
+            self.assertTrue(combined["profiled_outputs_bitwise_equal"])
+            self.assertEqual(combined["shape"], {"name": "ffn-down", "K": 14336, "M": 4096})
+            combined_stages = json.loads((args.out / "stage-profile.json").read_text())
+            self.assertIn("instrumented fused", combined_stages["scope"])
+            self.assertEqual(combined_stages["shape"], {"K": 14336, "M": 4096})
+            self.assertNotIn("profile_clock", (args.out / "fused-backend.cpp").read_text())
+            self.assertIn("profile_clock", (args.out / "profiled-backend.cpp").read_text())
+            self.assertTrue((args.out / "fused-compile_commands.json").exists())
+            self.assertEqual((args.out / "fused-CMakeCache.txt").read_bytes(), b"// compiler metadata: \xe0\xff\n")
+            args.out = root / "fused"
             fused = json.loads((args.out / "diagnosis.json").read_text())
             self.assertTrue(fused["fused_outputs_bitwise_equal"])
             comparisons = json.loads((args.out / "fused-comparison.json").read_text())
@@ -333,7 +352,7 @@ class LatestTest(unittest.TestCase):
             self.assertEqual(metadata["execution_profile"]["hostname"], "cnkunpengb04")
             self.assertEqual(metadata["execution_profile"]["cpus"], list(range(64, 128, 2)))
             measurements = [command for command in commands if command[0] == "numactl" and any(str(value).startswith("--bench-") for value in command)]
-            self.assertEqual(len(measurements), 33)
+            self.assertEqual(len(measurements), 45)
             for position, command in enumerate(measurements):
                 index = next(i for i, value in enumerate(command) if str(value).startswith("--bench-"))
                 first = 64 if position < 6 else 128
