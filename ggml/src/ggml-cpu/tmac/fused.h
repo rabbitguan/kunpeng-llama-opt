@@ -62,10 +62,10 @@ inline void prepare(int groups, float16_t * input, int8_t * lut, float16_t * sca
 
 // The frozen layout has 256 bit-plane entries for 64 output channels.
 template<int Rows>
-inline void fused(int k, const uint8_t * weights, const float16_t * scales, const row (&input)[Rows]) {
+inline void fused(int k, const uint8_t * weights, const float16_t * scales, const row (&input)[Rows], int block_begin = 0, int block_end = 8) {
     static_assert(Rows == 1 || Rows == 2, "unsupported T-MAC row count");
     const uint8x16_t mask = vdupq_n_u8(15);
-    for (int block = 0; block < 8; ++block) {
+    for (int block = block_begin; block < block_end; ++block) {
         float16x8_t partial[Rows][4];
         GGML_TMAC_UNROLL_ROWS
         for (int r = 0; r < Rows; ++r) {

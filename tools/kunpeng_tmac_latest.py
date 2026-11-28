@@ -328,6 +328,11 @@ def execute(args):
     print("Checking operator correctness", flush=True)
     run([*affinity(32), binaries["tmac"] / "tmac-latest-check"], out / "operator.log", env=env, output=out / "operator.jsonl")
     dispatch(out / "operator.log")
+    if fused:
+        print("Checking the 1024-output operator at 32 threads", flush=True)
+        run([*affinity(32), binaries["tmac"] / "tmac-latest-check", "--bench-tmac", "32", out / "small-operator.bin", "1024"],
+            out / "small-operator.log", env=env, output=out / "small-operator.jsonl")
+        dispatch(out / "small-operator.log", 32)
     for variant, build in binaries.items():
         print(f"Checking model logits: {variant}; log: {out / (variant + '-logits.log')}", flush=True)
         run([*affinity(32), build / "tmac-latest-logits", model, out / (variant + "-logits.bin")], out / (variant + "-logits.log"), env=env)

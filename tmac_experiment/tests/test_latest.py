@@ -60,6 +60,26 @@ class LatestTest(unittest.TestCase):
                 self.assertEqual(len(outputs[0]), 4096 * 40 * 4)
                 self.assertEqual(outputs[0], outputs[1])
 
+    @unittest.skipUnless(os.environ.get("TMAC_FUSED_CHECK"), "set the compiled fused ARM64 probe")
+    def test_fused_small_output_partitions_keep_thread_results_identical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = None
+            for threads in (1, 16, 32):
+                output = Path(directory) / f"small-{threads}.bin"
+                result = subprocess.run([os.environ["TMAC_FUSED_CHECK"], "--bench-tmac", str(threads), str(output), "1024"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual({(row["K"], row["M"], row["rows"]) for row in records}, {(4096, 1024, value) for value in (1, 7, 32)})
+                parts = 2 if threads == 32 else 1
+                self.assertIn(f"M=1024 rows=1 threads={threads} kernel_N=1 tiles=16 consumer=fused tile_parts={parts}", result.stderr)
+                self.assertIn(f"M=1024 rows=7 threads={threads} kernel_N=2 tiles=16 consumer=fused tile_parts=1", result.stderr)
+                self.assertEqual(len(output.read_bytes()), 1024 * 40 * 4)
+                if expected is None:
+                    expected = output.read_bytes()
+                else:
+                    self.assertEqual(output.read_bytes(), expected)
+
     def test_stage_profile_requires_complete_worker_groups_and_skips_warmups(self):
         records = []
         for count in (1, 7, 32):

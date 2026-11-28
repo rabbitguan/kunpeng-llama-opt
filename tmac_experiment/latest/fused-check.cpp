@@ -1,6 +1,7 @@
 #include TMAC_REFERENCE_SOURCE
 #include "../../ggml/src/ggml-cpu/tmac/fused.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -64,6 +65,23 @@ static void check(int k, int mode, std::mt19937 & random) {
         }
     }
     ggml_tmac::fused(k, packed.data() + 64, packed_scales.data() + 8, input);
+    std::vector<float> full[Rows];
+    for (int r = 0; r < Rows; ++r) full[r] = outputs[r];
+    const int boundaries[] = {0, 1, 3, 7, 8};
+    for (int part = 0; part < 4; ++part) {
+        const int begin = boundaries[part], end = boundaries[part + 1];
+        for (auto & values : outputs) std::fill(values.begin(), values.end(), 91);
+        ggml_tmac::fused(k, packed.data() + 64, packed_scales.data() + 8, input, begin, end);
+        for (int r = 0; r < Rows; ++r) {
+            for (int i = 0; i < 80; ++i) {
+                const float expected = i >= 8 + begin * 8 && i < 8 + end * 8 ? full[r][i] : 91;
+                if (std::memcmp(&expected, &outputs[r][i], sizeof(float))) {
+                    throw std::runtime_error("fused partition changed output or wrote outside its range");
+                }
+            }
+        }
+    }
+    for (int r = 0; r < Rows; ++r) std::memcpy(outputs[r].data(), full[r].data(), full[r].size() * sizeof(float));
     for (int r = 0; r < Rows; ++r) {
         alignas(64) float16_t partial[256] = {};
         for (int group = 0; group < groups; ++group) {

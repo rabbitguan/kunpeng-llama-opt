@@ -24,14 +24,15 @@ static void require(bool ok, const char * message) {
 int main(int argc, char ** argv) {
     try {
         const bool benchmark = argc >= 2 && (!strcmp(argv[1], "--bench-tmac") || !strcmp(argv[1], "--bench-native"));
-        require(argc == 1 || (benchmark && argc <= 4), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32 [OUTPUT]]]");
+        require(argc == 1 || (benchmark && argc <= 5), "usage: tmac-latest-check [--bench-tmac|--bench-native [1|16|32 [OUTPUT [1024|4096]]]]");
+        if (argc == 5) require(!strcmp(argv[4], "1024") || !strcmp(argv[4], "4096"), "invalid output dimension");
         int selected_threads = 0;
         if (argc >= 3) {
             require(!strcmp(argv[2], "1") || !strcmp(argv[2], "16") || !strcmp(argv[2], "32"), "invalid thread count");
             selected_threads = std::atoi(argv[2]);
         }
         std::ofstream output_file;
-        if (argc == 4) {
+        if (argc >= 4) {
             output_file.open(argv[3], std::ios::binary);
             require(output_file.good(), "cannot open operator output file");
         }
@@ -49,7 +50,8 @@ int main(int argc, char ** argv) {
             }
         }
         require(buft != nullptr, "requested CPU buffer is unavailable");
-        constexpr int k = 4096, m = 4096;
+        constexpr int k = 4096;
+        const int m = argc == 5 ? std::atoi(argv[4]) : 4096;
         auto * wc = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
         require(wc != nullptr, "weight context failed");
         auto * w = ggml_new_tensor_2d(wc, GGML_TYPE_Q4_0, k, m);

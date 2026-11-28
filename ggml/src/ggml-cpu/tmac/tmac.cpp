@@ -208,11 +208,19 @@ public:
         auto * scales = weights + aligned(size_t(m) * k / 2);
         const size_t weight_stride = size_t(k) * (c.bm / 4) / 2;
         const size_t scale_stride = size_t(c.scales_size / c.n_tile_num) * sizeof(half);
+        int tile_parts = 1;
 #if defined(GGML_TMAC_FUSED)
         if (fused) {
             const int row_blocks = (rows + 1) / 2;
-            for (int64_t task = params->ith; task < int64_t(row_blocks) * c.n_tile_num; task += params->nth) {
-                const size_t first = size_t(task / c.n_tile_num) * 2, tile = task % c.n_tile_num;
+            // Keep at least 64 output bytes per partition.
+            while (tile_parts < 4 && int64_t(row_blocks) * c.n_tile_num * tile_parts < params->nth) {
+                tile_parts *= 2;
+            }
+            const int blocks_per_part = 8 / tile_parts;
+            for (int64_t task = params->ith; task < int64_t(row_blocks) * c.n_tile_num * tile_parts; task += params->nth) {
+                const size_t row_tile = task / tile_parts;
+                const size_t first = row_tile / c.n_tile_num * 2, tile = row_tile % c.n_tile_num;
+                const int block_begin = int(task % tile_parts) * blocks_per_part;
                 auto * packed = weights + tile * weight_stride;
                 const auto * packed_scales = reinterpret_cast<const float16_t *>(scales + tile * scale_stride);
                 auto make_row = [&](size_t row) {
@@ -224,10 +232,18 @@ public:
                 };
                 if (first + 1 < size_t(rows)) {
                     const ggml_tmac::row input_rows[2] = {make_row(first), make_row(first + 1)};
-                    ggml_tmac::fused(k, packed, packed_scales, input_rows);
+                    if (tile_parts == 1) {
+                        ggml_tmac::fused(k, packed, packed_scales, input_rows);
+                    } else {
+                        ggml_tmac::fused(k, packed, packed_scales, input_rows, block_begin, block_begin + blocks_per_part);
+                    }
                 } else {
                     const ggml_tmac::row input_rows[1] = {make_row(first)};
-                    ggml_tmac::fused(k, packed, packed_scales, input_rows);
+                    if (tile_parts == 1) {
+                        ggml_tmac::fused(k, packed, packed_scales, input_rows);
+                    } else {
+                        ggml_tmac::fused(k, packed, packed_scales, input_rows, block_begin, block_begin + blocks_per_part);
+                    }
                 }
             }
         }
@@ -247,8 +263,8 @@ public:
         if (params->ith == 0) {
             const unsigned phase = rows == 1 ? 1 : 2;
             if (!(logged.fetch_or(phase) & phase)) {
-                GGML_LOG_INFO("tmac: compute tensor=%s K=%d M=%d rows=%d threads=%d kernel_N=%d tiles=%d consumer=%s\n",
-                              weight->name, k, m, rows, params->nth, fused && rows > 1 ? 2 : 1, c.n_tile_num, fused ? "fused" : "generated");
+                GGML_LOG_INFO("tmac: compute tensor=%s K=%d M=%d rows=%d threads=%d kernel_N=%d tiles=%d consumer=%s tile_parts=%d\n",
+                              weight->name, k, m, rows, params->nth, fused && rows > 1 ? 2 : 1, c.n_tile_num, fused ? "fused" : "generated", tile_parts);
             }
         }
         return true;
